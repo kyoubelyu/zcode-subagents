@@ -1,46 +1,104 @@
 ---
 name: zcode-subagents
-description: Delegate independent coding, investigation, or review tasks to the official ZCode CLI from Codex. Use when the user asks for ZCode or GLM workers, or has authorized ZCode delegation in this workflow.
+description: Delegate bounded coding, investigation, or review tasks from Codex to the installed ZCode Desktop app-server. Use when the user asks for ZCode or GLM workers, or authorizes ZCode delegation in the workflow.
 ---
 
-Keep planning, ambiguous decisions, integration, and final verification in Codex.
-Give ZCode bounded tasks with concrete acceptance criteria. Reuse the user's
-existing ZCode model and login configuration; this plugin does not select a model.
+Keep planning, ambiguous decisions, integration and final verification in Codex.
+Give ZCode concrete tasks and acceptance criteria. Workers do not inherit the
+Codex conversation. Review their evidence before relying on it.
 
-Use the plugin's zcode_spawn/status/wait/followup/cancel/list tools. These workers
-are external CLI processes, not native spawn_agent or wait_agent sessions.
+## Invoke the bundled client
 
-- Choose a stable workflow_id for the current assignment. Give each new task a
-  distinct request_key; reuse the identical request when retrying a lost reply.
-- Include the objective, relevant files, scope, constraints, checks to run, and
-  expected deliverables. Supply necessary context explicitly; workers do not
-  inherit the Codex conversation. Treat worker output as evidence to review.
-- Use kind=analysis for investigation/review. It uses ZCode plan mode in the
-  supplied directory. Use kind=edit for changes: the plugin requires a clean Git
-  source snapshot and creates a worktree. Do not stash, commit, or discard the
-  user's pending changes merely to satisfy that prerequisite. Prepare an
-  appropriate snapshot within the authorized task or use analysis instead.
-- The shared pool runs at most 12 workers. Queue independent work; do not create
-  extra data directories to bypass the pool limit. Recursive Agent/workflow tools
-  are denied. Permission modes and worktrees are not OS sandboxes.
-- The official CLI's headless edit mode cannot approve Bash commands. This
-  plugin disables Bash explicitly instead of upgrading to yolo. Ask workers to
-  write tests and return exact commands; run those checks from Codex after
-  reviewing the worktree. Do not promise autonomous shell execution.
-- Spawn returns immediately. Continue useful local work while tasks run.
-  zcode_wait returns after a short slice; reuse wait_id to preserve its original
-  15-minute deadline (configurable 10–30 minutes). Waiting out never cancels work.
-  A separate run_timeout_ms can stop execution; 0 leaves it unset.
-- Followups use --resume and retain the original workspace. A followup to a busy
-  task queues until that task ends; it does not steer the running turn. Continue
-  from the returned followup task ID, not the original parent.
-- A task's succeeded state means the CLI returned a structured result with exit
-  code 0. Read the response, inspect the diff and new files, and run relevant
-  checks before incorporating changes. changes.patch includes tracked changes;
-  untrackedFiles remain in the retained worktree. The plugin never merges them.
-- Use status/list after reconnecting. Review interrupted/failed artifacts before
-  explicitly retrying; avoid blindly replaying tasks with side effects. Cancel
-  obsolete tasks and wait for a terminal state before treating their slot as free.
+Resolve the plugin root as two directories above this SKILL.md's directory.
+Use the exact installed path; do not assume a particular version/cache path.
 
-Keep task directories private. Logs and prompts may contain source code or user
-data; do not publish them with the plugin or paste entire logs into the chat.
+```text
+node <plugin-root>/dist/control.mjs doctor
+node <plugin-root>/dist/control.mjs models
+node <plugin-root>/dist/control.mjs <spawn|status|list|wait|followup|cancel> --json-file <request.json>
+```
+
+These are short JSON commands, not MCP tools or the ZCode CLI. Do not call old
+zcode_spawn MCP tools, `zcode -p`, or native spawn_agent for this backend. Use a
+private JSON file (or literal JSON via --stdin) to avoid interpreting prompt text
+as shell code. Do not interpolate arbitrary prompts into a shell command.
+
+`doctor` reports desktop availability, pool settings and default model. `models`
+lists providerId/modelId and reasoningLevels. Both can start the existing desktop
+Host without calling a model. The plugin only starts/reuses its own Host using
+existing desktop files. Never install, upgrade, patch or rebuild ZCode to repair
+this integration without a separate user instruction. Authentication belongs to
+ZCode; do not copy tokens or modify account files.
+
+## Requests and model routing
+
+Spawn payload:
+
+```json
+{
+  "workflow_id": "stable-workflow-name",
+  "request_key": "unique-bounded-task",
+  "cwd": "/absolute/workspace/path",
+  "kind": "analysis",
+  "prompt": "Objective, files, constraints, acceptance criteria and expected deliverables.",
+  "model": "default",
+  "run_timeout_ms": 0
+}
+```
+
+Use a stable workflow_id. Reuse the identical request_key and payload to recover
+from a lost submission reply. A different task needs a different key.
+
+New tasks with model omitted or `"default"` resolve the current ZCode default when
+they start. Do not claim a hardcoded default; inspect `models`/`doctor`. Explicit:
+
+```json
+{"model":{"providerId":"<from models>","modelId":"<from models>","options":{"reasoningLevel":"<supported level>"}}}
+```
+
+The Host validates selections; invalid ones fail without fallback. If reasoning
+is omitted, the resolver chooses the last advertised level. Specify it when the
+user cares about reasoning cost or latency. Per-input overrides do not change the
+configured default. Check effectiveModel and observedModel in the result.
+
+Followup payload: `task_id`, a new `request_key`, `prompt`, optional `model` and
+`run_timeout_ms`. Omitted model inherits the parent's effective model; `"default"`
+resolves the current default again. It queues behind a busy parent and resumes
+the same session/workspace. Continue from its returned task ID; sibling followups
+are rejected. Followups do not steer an active turn.
+
+## Execution and review
+
+- Use analysis for investigation/review. It enables plan state and allows
+  reading/search tools. Use edit for implementation in an isolated Git worktree.
+  Edit requires a clean source repository with a commit. Do not stash, commit or
+  discard unrelated user changes just to satisfy this requirement; prepare an
+  appropriate snapshot within the task's authorization or use analysis.
+- At most 12 tasks run across clients sharing the data directory. Extra work
+  queues. Do not make new data directories to bypass this limit.
+- Bash, recursive agents, workflows and third-party MCP tools are outside the
+  task allowlist. Ask workers to write tests and return commands. Review files,
+  then run checks from Codex. Do not promise worker shell execution.
+- Spawn returns a task_id immediately. Continue independent local work.
+  status/cancel take `{"task_id":"<id>"}`. list accepts optional workflow_id.
+- Start a wait with `{"task_ids":["<id>"],"mode":"all"}` (or mode any).
+  Each call returns after at most 20 seconds. Repeat with
+  `{"wait_id":"<returned id>"}` until ready or timed_out. The logical timeout
+  defaults to 15 minutes and accepts timeout_ms from 600000 to 1800000. A wait
+  timeout never cancels work. run_timeout_ms separately limits execution;
+  0 leaves it unset.
+- succeeded means V4 reported the submitted turn completed with a response.
+  Read the response, inspect changes.patch and untrackedFiles in the retained
+  worktree, and run meaningful checks. Usage is session cumulative, including
+  earlier turns. No automatic merge or publication occurs.
+- Client exits and supervisor restarts preserve work. Use status/list to
+  reconnect. Runtime crashes are reported without replay. Review failed or
+  interrupted artifacts before explicitly retrying. cleanup_pending retains
+  its concurrency slot until the session is confirmed stopped.
+- Cancel obsolete tasks and confirm a terminal state before treating the slot
+  as free. Cancellation stops only that session, never the shared Host or the
+  desktop application's processes. Do not kill unrelated ZCode processes.
+
+Keep task artifacts private. They can contain source code and user data; do not
+publish them with the plugin or paste entire diagnostic logs into chat. Runtime
+permission controls and Git worktrees are not an OS sandbox.

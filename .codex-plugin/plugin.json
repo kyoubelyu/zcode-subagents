@@ -1,7 +1,7 @@
 {
   "name": "zcode-subagents",
-  "version": "0.1.0+codex.20260922024859",
-  "description": "Let Codex orchestrate up to 12 persistent ZCode subagents with resumable sessions and isolated edit worktrees.",
+  "version": "0.2.0+codex.20260922154954",
+  "description": "Delegate to the installed ZCode Desktop app-server with explicit model routing and a shared 12-task limit.",
   "author": {
     "name": "kyoubelyu"
   },
@@ -19,7 +19,6 @@
     "defaultPrompt": "Use ZCode subagents for independent parts of this task, then review their results.",
     "websiteURL": "https://github.com/kyoubelyu/zcode-subagents"
   },
-  "mcpServers": "./.mcp.json",
   "license": "MIT",
   "repository": "https://github.com/kyoubelyu/zcode-subagents"
 }

@@ -1,46 +1,56 @@
 # ZCode Subagents
 
-A Codex plugin that puts Astra in charge and lets ZCode handle delegated work, with up to **12 concurrent workers**.
+A Codex plugin that puts Astra in charge and delegates bounded work to ZCode Desktop's app-server, with up to **12 concurrent tasks**.
 
 ## Why I built this
 
 For my workflow, Astra is good, but too slow and expensive to use for every small coding task. GLM is cheaper, but dumber.
 
-I want Astra to understand the problem, split it into sensible tasks, make the hard calls, and check the result. I want GLM to handle the bounded work: inspect a module, trace a bug, write a focused patch, or review a change.
+I want Astra to understand the problem, divide the work, make the hard calls, and check the result. I want GLM to inspect a module, trace a bug, write a focused patch, or review a change.
 
-This plugin brings them together in one workflow. I stay in Codex, delegate through ZCode, and bring the results back for review.
-
-The plugin runs whatever model you have configured in ZCode. It does not force GLM, change your Codex model, or include either model subscription.
+This plugin brings them together in my workflow. I stay in Codex, delegate through the ZCode app-server, then review and integrate the results. It uses the models available in your ZCode installation; it does not include a model subscription or change your Codex model.
 
 ## How it works
 
 ```text
-You → Codex / Astra → ZCode task pool → results, usage, logs, worktrees
-          ↑                                      |
-          └──────── review and integrate ─────────┘
+Codex / Astra
+  → plugin skill → short JSON command → persistent task supervisor (12 slots)
+                                      → shared desktop Host connection
+                                        → workspace app-server → selected model
+  ← results, usage, progress, isolated Git worktrees
 ```
 
-The skill teaches Codex how to delegate. A local MCP server exposes the tools. A detached supervisor manages the queue, and each task runs in its own worker process.
+Version **0.2 uses the existing desktop runtime directly**. It does not invoke `zcode -p`, require the ZCode CLI on PATH, or expose a Codex MCP server. Codex uses the bundled `dist/control.mjs` client through the plugin skill. Each command can exit without stopping its task.
 
-- **12 workers maximum**, shared by all clients using the same data directory. Extra tasks queue.
-- **Persistent tasks.** Closing an MCP connection does not kill its workers. Reconnecting clients can query them.
-- **Resumable conversations.** Followups use ZCode's `--resume`. Followups to busy tasks wait in the queue.
-- **Isolated edits.** Edit tasks get a Git worktree based on an explicit clean HEAD. The plugin never merges it into your checkout.
-- **Actual cancellation.** Queued tasks are removed from execution; active model process groups receive SIGTERM, then SIGKILL after a grace period if needed.
-- **Structured results.** Status includes the final response, token usage when reported, progress, and artifact paths.
-- **Idempotent submissions.** Retrying the same workflow/request key returns the existing task.
+The plugin starts a Host from the desktop's existing files when needed and reuses **its own** Host instance across clients and tasks. That official Host starts and reuses workspace app-servers and handles ZCode account authentication. The plugin does not attach to private stdio pipes belonging to the running desktop application.
 
-These are external ZCode processes. They use this plugin's tools, not Codex's native `spawn_agent` or `wait_agent`.
+The plugin does **not** download, install, build, upgrade, patch, or vendor ZCode's runtime. It holds the connection needed to use it. It does not supervise runtime upgrades or automatically replay work after a crash. A later explicit request can start a fresh instance from the same files.
+
+- **At most 12 active tasks** across clients using the same data directory; extra tasks queue.
+- **Persistent task IDs and results.** Client exit and supervisor restart preserve work.
+- **Linear followups** in the same session and workspace, with model inheritance or an explicit override.
+- **Isolated edits** in Git worktrees. The source repository must have a commit and be clean, including ordinary untracked files.
+- **Cancellation targets one session.** It does not kill the shared Host or another task.
+- **Idempotent submissions.** Identical workflow/request keys return the existing task; conflicting reuse is rejected.
+- **No automatic integration.** Codex reviews the patch and new files and runs relevant checks.
+
+These are external ZCode sessions, separate from Codex's native `spawn_agent` and `wait_agent`.
 
 ## Requirements
 
-- Linux or WSL. Version 0.1 uses Linux process identities and Unix process groups; macOS and native Windows are not supported yet.
-- Node.js 22 or newer for the plugin, Git, and `flock` from util-linux.
-- The **official [zai-org/ZCode](https://github.com/zai-org/ZCode) CLI**, available as `zcode` on PATH.
-- A working ZCode model configuration. Run `zcode --version` and a small prompt first; run `zcode login` if your configuration requires login.
-- Codex with local plugin and stdio MCP support (native loading verified with Codex CLI 0.155.1).
+- Linux or WSL, Node.js **22.2 or newer**, Git, and util-linux `flock`.
+- An existing [ZCode Desktop](https://github.com/zai-org/ZCode) installation with these Linux/WSL runtime files:
 
-Tested with official ZCode CLI **0.16.9**. Its build/runtime requirements are separate from this plugin's Node requirement. Use the official repository's installation instructions; the similarly named `zcode-app-cli` package is an unofficial client.
+  ```text
+  ~/.zcode/server/node
+  ~/.zcode/server/zcode-server.cjs
+  ~/.zcode/server/agents/glm/zcode.cjs
+  ```
+
+- A usable model/account configuration in ZCode. Existing authentication is reused by the official Host. If it expires, resolve it in ZCode Desktop.
+- Codex with plugin skills and local command execution.
+
+The integration was tested against desktop Host **3.14.3**, its installed agent app-server **0.16.9**, and V4 wire protocol **3**. The desktop protocol can change; incompatible installations produce errors rather than triggering a runtime modification. Native Windows and macOS are not supported by this release.
 
 ## Install in Codex
 
@@ -49,98 +59,129 @@ codex plugin marketplace add kyoubelyu/zcode-subagents
 codex plugin add zcode-subagents@zcode-subagents-community
 ```
 
-Start a **new Codex thread** so the skill and tools are loaded. The repository includes the built runtime in `dist/`, so installing the plugin does not need an npm install or build step.
+Start a **new Codex thread** to load the updated skill. Built files are committed in `dist/`; plugin installation needs no npm build.
 
 Try:
 
-> Use ZCode subagents to investigate the parser and the cache independently. Review their findings before changing anything.
+> Use ZCode subagents to investigate the parser and cache independently, using the default model. Review the findings.
 
-Or:
+> Give ZCode a focused implementation task in a worktree. Choose GLM-5.3 explicitly, inspect its diff, and run its tests.
 
-> Give ZCode a focused implementation task in a worktree. Inspect its diff and run the relevant tests before integrating it.
+### Upgrading from 0.1
 
-The existing ZCode login and selected model are reused. The plugin does not copy credentials.
+Finish or cancel old tasks, then run `node scripts/control.mjs stop` from the old source checkout if its supervisor is still running. Update/reinstall the plugin and open a new Codex thread. The new plugin has no MCP registration, so an old thread's closed MCP connection is not a way to invoke it.
 
-## Tools
+Existing task artifacts and worktrees are retained. New tasks use the desktop backend. Followups to historical CLI sessions depend on whether the installed desktop app-server can resume that history; completed old results remain readable. `ZCODE_SUBAGENTS_BIN` is no longer used.
 
-| Tool | Purpose |
+## Command interface
+
+Resolve `<plugin-root>` from the installed skill's location, then invoke:
+
+```bash
+node <plugin-root>/dist/control.mjs doctor
+node <plugin-root>/dist/control.mjs models
+node <plugin-root>/dist/control.mjs spawn --json-file request.json
+```
+
+`doctor` checks runtime availability and settings; `models` reads the current default and available provider/model IDs. They may start the installed Host, but do not send a model prompt. All commands return JSON. Supply payloads using `--json-file` or `--stdin`, preserving prompt text literally.
+
+| Command | Purpose |
 | --- | --- |
-| `zcode_spawn` | Start or queue a task; return its task ID immediately |
-| `zcode_status` | Read progress, results, usage and artifact paths |
-| `zcode_wait` | Wait for any/all tasks, preserving a logical deadline across short calls |
-| `zcode_followup` | Continue a conversation in its existing ZCode session and workspace |
-| `zcode_cancel` | Request cancellation and retain artifacts |
-| `zcode_list` | Find recent tasks, optionally filtered by workflow |
-| `zcode_doctor` | Check the CLI, shared worker limit and plugin settings without calling a model |
+| `spawn` | Queue a new task and return its ID |
+| `status` | Read a task's progress, response, usage and artifacts |
+| `list` | Find tasks, optionally by `workflow_id` |
+| `wait` | Wait for any/all tasks, preserving a logical deadline |
+| `followup` | Continue the same session; return a new task ID |
+| `cancel` | Stop one task and retain its artifacts |
+| `doctor` | Inspect runtime availability, pool and wait settings |
+| `models` | Read the default and available model selections |
 
-A spawn request looks like:
+Example `request.json`:
 
 ```json
 {
   "workflow_id": "parser-cleanup",
-  "request_key": "review-error-handling",
+  "request_key": "review-errors",
   "cwd": "/path/to/project",
   "kind": "analysis",
-  "prompt": "Trace parser error handling. Identify concrete bugs, cite files, and suggest checks. Do not modify files.",
+  "prompt": "Trace parser error handling. Cite concrete bugs and suggest checks. Do not modify files.",
+  "model": "default",
   "run_timeout_ms": 0
 }
 ```
 
-Use `kind: "edit"` for implementation. The source repository must have an existing commit and be clean, including ordinary untracked files. This avoids silently dropping your pending work from the worker's snapshot. Ignored files such as local credentials and dependencies are not copied into worktrees.
+Use `kind: "edit"` for a worktree. Ignored files, including local credentials and dependencies, are not copied into it.
 
-Pass the original `task_id` to `zcode_followup`. It returns a new task ID; use that ID for the next followup. Conversations are linear, so sibling followups are rejected. Live steering is not implemented.
+## Choosing a model
 
-## Waiting is separate from execution
+| Request | Selection |
+| --- | --- |
+| New task, `model` omitted | ZCode's configured default when the worker starts |
+| Any task, `"model": "default"` | Read that current default explicitly |
+| Followup, `model` omitted | Inherit the parent's effective selection |
+| Explicit model object | Validate and use that provider/model for this input |
 
-Logical waits default to **15 minutes**, accept **10–30 minutes**, and return after at most **20 seconds per tool call** so Codex can remain responsive. Repeat `zcode_wait` with the returned `wait_id` to keep the original deadline.
+Example explicit override, using IDs returned by `models`:
 
-A wait timeout leaves the task running. `run_timeout_ms` is a separate execution deadline; `0` means no deadline. Use `zcode_cancel` to stop an unwanted task.
+```json
+{
+  "model": {
+    "providerId": "account:bigmodel-individual-coding-plan",
+    "modelId": "GLM-5.3",
+    "options": { "reasoningLevel": "low" }
+  }
+}
+```
 
-These defaults match my Codex waiting preferences. The plugin does not modify or inherit native `multi_agent_v2` settings.
+If an explicit selection omits reasoning, the resolver uses the last level in the model's advertised ordering (the tested GLM models advertise `low`, `high`, `max`). Pass a level for deterministic behavior. Unknown models or unsupported reasoning levels fail; there is no silent fallback.
+
+Per-input overrides do not change the configured default. Status records `requestedModel`, `effectiveModel`, and the app-server's `observedModel`. No model ID is hardcoded as the plugin default. On the machine used for the live test, the default was **GLM-5.3-Flash / max**.
+
+For a followup, pass `task_id`, a new `request_key`, and `prompt`; optionally pass `model`. Followups wait for their parent to finish. Continue from the returned task ID, since sibling followups are rejected. This does not steer an in-progress turn.
+
+## Waiting, failures and review
+
+Waits default to **15 minutes**, accept **10–30 minutes**, and return after at most **20 seconds per command**. Repeat `wait` with its returned `wait_id` to retain the original deadline. A wait timeout leaves the task running. `run_timeout_ms` is a separate execution deadline; `0` leaves it unset.
+
+The plugin uses V4 commands and authoritative conversation snapshots. `succeeded` means it observed the submitted turn finish successfully with an assistant response. It does not mean the generated code is correct or its suggested tests ran. Usage is the session's cumulative usage, including earlier followup turns.
+
+After a worker crash, the supervisor stops that session before releasing its slot. If it cannot confirm that work stopped, `cleanup_pending` keeps the slot occupied. A Host or workspace app-server replacement fails the affected task without resubmitting it. Review failed/interrupted artifacts before explicitly retrying.
+
+Edit results include the worktree, branch, `changes.patch`, and `untrackedFiles`. Review both tracked and new files. No changes are automatically merged into your checkout. Remove worktrees only after retaining the changes you want.
+
+Analysis tasks enable ZCode's plan state and allow reading/search tools. Edit tasks additionally allow `Edit` and `Write`. Both can use todo tools; Bash, recursive delegation, workflows, and third-party MCP tools are outside the allowlist. Workers write tests and return commands for **Codex to run after review**. Unexpected interactive requests stop the task for review. These controls and worktrees are not an OS sandbox; execution uses your OS account and the installed ZCode runtime.
 
 ## Configuration and local data
 
-Set these in the environment used to launch the MCP server:
+Set these in the environment used to invoke the plugin client:
 
 | Variable | Default |
 | --- | --- |
-| `ZCODE_SUBAGENTS_BIN` | `zcode` from PATH |
+| `ZCODE_SUBAGENTS_RUNTIME_ROOT` | `~/.zcode/server`; must already contain the desktop files |
 | `ZCODE_SUBAGENTS_CONCURRENCY` | `12`; accepts 1–12 |
 | `ZCODE_SUBAGENTS_HOME` | `~/.local/share/zcode-subagents` |
 
-All clients sharing the data directory share one supervisor and concurrency limit. Keep that directory path short enough for a Unix socket. Changing the concurrency setting requires stopping the existing supervisor; finish or cancel tasks first.
+Clients sharing the data directory share the supervisor and Host. Do not use extra directories to bypass the pool limit. Finish tasks and stop the supervisor before changing its settings. A different runtime root requires explicitly stopping the plugin-owned Host after its tasks finish; the client never takes over an incompatible live instance.
 
-Each task retains its prompt, state, stdout/stderr logs, final result, and any edit worktree. Directories are private to the current OS user. Results and logs can contain source code or other sensitive task data; they are not part of this repository.
+Task prompts, state, progress, results and worktrees are retained in private directories. Adapter logs remain local. They can contain source code or other task data; do not publish them. The plugin does not read or copy account credentials into task requests or results.
 
-The supervisor survives MCP disconnection. Workers also survive a supervisor restart. If a worker crashes, the supervisor cleans up its model process group, marks the task interrupted, and does not automatically replay it.
+`node scripts/control.mjs status` inspects the supervisor; `node scripts/control.mjs stop` stops only the supervisor. Workers and the Host survive that operation. No plugin command installs or repairs ZCode.
 
-Use `node scripts/control.mjs status` to inspect the supervisor or `node scripts/control.mjs stop` to stop it. Stopping the supervisor does not cancel workers; they are rediscovered when the plugin is used again.
-
-## Reviewing changes
-
-An edit result includes its worktree path, branch, `changes.patch` and `untrackedFiles`.
-
-- The patch includes tracked changes relative to the original base commit, including changes the worker committed.
-- New untracked files remain in the worktree and are listed separately.
-- Nothing is automatically applied, committed, merged, pushed or published in your main checkout by the plugin.
-
-Review both the patch and the new files, then integrate the work through your normal Git workflow. Remove completed worktrees with `git worktree remove <path>` only after retaining the changes you want. Task artifacts are kept until you explicitly delete them.
-
-Analysis tasks use ZCode's `plan` permission mode; edit tasks use `edit`. Recursive Agent and workflow tools are denied. These controls and Git worktrees are **not an OS sandbox**. ZCode runs with your user account's access, and existing ZCode plugins/configuration can affect its behavior.
-
-The official CLI's headless `edit` mode cannot approve Bash commands. Version 0.1 therefore disables Bash explicitly. Workers can inspect and edit files and write tests; **Codex runs the returned test commands**. The plugin does not switch to `yolo` to get around this limitation.
-
-## Development
+## Development and validation
 
 ```bash
-git clone https://github.com/kyoubelyu/zcode-subagents.git
-cd zcode-subagents
 npm ci
 npm run check
 ```
 
-The tests use a fake CLI and temporary repositories. They cover the 12-worker cap and queue, request deduplication, followups, worktree isolation, failure reporting, process-group cancellation, separate wait/execution deadlines, MCP transport, and reconnection. They do not need model credentials.
+Tests use a fake desktop Host and temporary repositories, with no model credentials. They cover the 12-task cap, queue, deduplication, default/explicit models, followup inheritance, isolated edits, cancellation, wait deadlines, client exit, supervisor restart, worker/Host crashes, and binary/snapshot framing.
 
-Rebuild and commit `dist/` when changing runtime source. GitHub Actions checks that the committed bundle matches the source. A real-model smoke test is separate and may consume your ZCode provider quota.
+A separate live test consumes provider quota:
 
-The code is MIT licensed. Bundled dependency licenses are in `dist/THIRD-PARTY-NOTICES.txt`.
+```bash
+node scripts/smoke.mjs
+```
+
+It checks the default model, an explicit override, a real edit and Python tests, followup inheritance, reset to `default`, Host reuse, and unchanged runtime-file hashes/default selection. Set `ZCODE_SUBAGENTS_SMOKE_MODEL` to a JSON model object to choose its explicit override. Its temporary fixture and task artifacts are retained for inspection.
+
+Commit rebuilt `dist/` with source changes. GitHub Actions checks tests and bundle consistency. Protocol implementation notes are in [docs/app-server.md](docs/app-server.md). The plugin is MIT licensed; bundled dependency notices are in [dist/THIRD-PARTY-NOTICES.txt](dist/THIRD-PARTY-NOTICES.txt).

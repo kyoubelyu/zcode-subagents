@@ -10,7 +10,7 @@ if (!await sameProcess(owner)) {
   console.log('Supervisor is not running.');
 } else if (command === 'stop') {
   process.kill(owner.pid, 'SIGTERM');
-  console.log('Supervisor stop requested. Existing workers continue; use zcode_cancel to cancel tasks.');
+  console.log('Supervisor stop requested. Existing workers and Host continue; use dist/control.mjs cancel to cancel a task.');
 } else {
   console.log(JSON.stringify(await request(config, undefined, undefined, true), null, 2));
 }

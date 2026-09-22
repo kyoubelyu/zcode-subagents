@@ -1,6 +1,8 @@
 import { z } from 'zod';
 
 const id = z.string().uuid();
+const model = z.union([z.literal('default'), z.object({ providerId: z.string().trim().min(1), modelId: z.string().trim().min(1),
+  options: z.object({ reasoningLevel: z.string().trim().min(1).optional() }).strict().optional() }).strict()]);
 const runTimeout = z.number().int().min(0).max(86400000).default(0)
   .describe('Execution limit in milliseconds; 0 means no runtime deadline. Independent of wait timeouts.');
 export const schemas = {
@@ -10,12 +12,14 @@ export const schemas = {
     cwd: z.string().min(1).describe('Absolute workspace path. Edit tasks require a clean Git repository.'),
     kind: z.enum(['analysis', 'edit']).default('analysis'),
     prompt: z.string().min(1).max(65536),
+    model: model.optional().describe('Explicit ZCode selection, or "default". Omit to use the current ZCode default.'),
     run_timeout_ms: runTimeout,
   }).strict(),
   zcode_status: z.object({ task_id: id }).strict(),
   zcode_followup: z.object({
     task_id: id, request_key: z.string().min(1).max(128),
     prompt: z.string().min(1).max(65536), run_timeout_ms: runTimeout,
+    model: model.optional().describe('Override this followup model; "default" resolves the current default. Omit to inherit the parent effective model.'),
   }).strict(),
   zcode_cancel: z.object({ task_id: id }).strict(),
   zcode_list: z.object({
@@ -29,6 +33,7 @@ export const schemas = {
     timeout_ms: z.number().int().min(600000).max(1800000).default(900000),
   }).strict(),
   zcode_doctor: z.object({}).strict(),
+  zcode_models: z.object({}).strict(),
 };
 export function validate(method, params) {
   const schema = schemas[method];

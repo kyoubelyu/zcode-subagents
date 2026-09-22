@@ -5,9 +5,11 @@ import { fileURLToPath } from 'node:url';
 import { atomicJson, readJson, privateDir, newId, taskDir, now, digest, sameProcess,
   TERMINAL, WAIT_DEFAULT, WAIT_MIN, WAIT_MAX, delay, processIdentity } from './common.mjs';
 import { inspectWorkspace } from './workspace.mjs';
+import { hostCall } from './host-client.mjs';
+import { runningConversation } from './conversation.mjs';
 
 const workerPath = fileURLToPath(new URL('./worker.mjs', import.meta.url));
-const active = (state) => ['starting', 'preparing', 'running'].includes(state);
+const active = (state) => ['starting', 'preparing', 'running', 'cleanup_pending'].includes(state);
 
 export class Supervisor {
   constructor(config) {
@@ -46,8 +48,9 @@ export class Supervisor {
     return {
       task_id: id, workflow_id: spec.workflowId, kind: spec.kind, parent_task_id: spec.parentTaskId,
       created_at: spec.createdAt, ...state,
-      artifacts: { directory: dir, stdout: path.join(dir, 'stdout.log'),
-        stderr: path.join(dir, 'stderr.log'), result: path.join(dir, 'result.json') },
+      artifacts: { directory: dir, worker: path.join(dir, 'worker.log'),
+        ...(state.backend === 'desktop-app-server' ? { progress: path.join(dir, 'progress.jsonl') } :
+          { stdout: path.join(dir, 'stdout.log'), stderr: path.join(dir, 'stderr.log') }), result: path.join(dir, 'result.json') },
     };
   }
   async list(workflowId) {
@@ -72,7 +75,7 @@ export class Supervisor {
       const id = newId();
       const spec = {
         id, workflowId: input.workflow_id, requestKey: input.request_key, requestHash,
-        prompt: input.prompt, kind: input.kind, runTimeoutMs: input.run_timeout_ms || 0,
+        prompt: input.prompt, kind: input.kind, runTimeoutMs: input.run_timeout_ms || 0, model: input.model,
         createdAt: now(), ...context,
       };
       await atomicJson(path.join(taskDir(this.config, id), 'spec.json'), spec);
@@ -102,6 +105,7 @@ export class Supervisor {
         ...parent.spec, id, parentTaskId: input.task_id, requestKey: input.request_key, requestHash,
         prompt: input.prompt, createdAt: now(), sessionId: undefined, workspace: undefined,
         runTimeoutMs: input.run_timeout_ms || 0,
+        model: input.model,
       };
       await atomicJson(path.join(taskDir(this.config, id), 'spec.json'), spec);
       return this.status(id);
@@ -129,6 +133,29 @@ export class Supervisor {
           count++;
           if (task.state.workspace) busyWorkspaces.add(task.state.workspace);
         } else {
+          // The worker can commit its final state and exit after this tick read
+          // the initial snapshot. Re-read only after confirming the owner died.
+          // Otherwise cleanup would overwrite a successful result as interrupted.
+          task.state = (await this.task(task.spec.id)).state;
+          if (!active(task.state.status)) continue;
+          if (task.state.appServer) {
+            // App-server is shared. Stop only this session, never its Host process.
+            const host = task.state.appServer;
+            if (await sameProcess({ pid: host.hostPid, identity: host.hostIdentity })) {
+              try {
+                const params = { instance: host.instance, workspacePath: task.state.workspace, sessionId: task.state.sessionId };
+                await hostCall(this.config, 'stop', params);
+                const snapshot = await hostCall(this.config, 'snapshot', params);
+                if (runningConversation(snapshot)) { count++; continue; }
+              } catch {
+                count++;
+                if (task.state.status !== 'cleanup_pending') await atomicJson(path.join(task.dir, 'runtime.json'), {
+                  ...task.state, status: 'cleanup_pending', error: 'Worker stopped; waiting to confirm its app-server session has stopped.',
+                });
+                continue;
+              }
+            }
+          }
           // A dead worker may have left its model process alive. Keep its slot
           // occupied until that exact process exits; never blindly replay work.
           const child = await readJson(path.join(task.dir, 'child.json'));
@@ -144,7 +171,7 @@ export class Supervisor {
             try { process.kill(-child.pid, 'SIGKILL'); } catch {}
           }
           task.state = { ...task.state, status: 'interrupted', finishedAt: now(),
-            error: 'Worker exited without a final result. Inspect artifacts before explicitly retrying.' };
+            error: task.state.error || 'Worker exited without a final result. Inspect artifacts before explicitly retrying.' };
           await atomicJson(path.join(task.dir, 'runtime.json'), task.state);
         }
       }
@@ -167,6 +194,7 @@ export class Supervisor {
           }
           task.spec.sessionId = parent.state.sessionId;
           task.spec.workspace = parent.state.workspace;
+          task.spec.model ??= parent.state.effectiveModel || parent.spec.model;
           await atomicJson(path.join(task.dir, 'spec.json'), task.spec);
         }
         if (task.spec.workspace && busyWorkspaces.has(task.spec.workspace)) continue;
@@ -177,7 +205,7 @@ export class Supervisor {
         try {
           const worker = spawn(process.execPath, [workerPath, task.spec.id], {
             env: { ...process.env, ZCODE_SUBAGENTS_HOME: this.config.home,
-              ZCODE_SUBAGENTS_BIN: this.config.binary },
+              ZCODE_SUBAGENTS_RUNTIME_ROOT: this.config.runtimeRoot },
             stdio: ['ignore', log, log], detached: true,
           });
           worker.once('error', (error) => {

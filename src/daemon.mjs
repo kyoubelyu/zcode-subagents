@@ -1,21 +1,20 @@
 import http from 'node:http';
 import { promises as fs } from 'node:fs';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Supervisor } from './supervisor.mjs';
 import { validate } from './schemas.mjs';
 import { settings, VERSION, privateDir, atomicJson, processIdentity } from './common.mjs';
+import { desktopRuntime } from './desktop-runtime.mjs';
+import { ensureHost, hostCall } from './host-client.mjs';
 
-const execute = promisify(execFile);
 export async function startDaemon(config = settings()) {
   process.umask(0o077);
   await privateDir(config.home);
   const lockPath = path.join(config.home, 'supervisor.lock');
   // The launcher holds an OS flock for this process's entire lifetime.
   // Workers do not inherit it; reconnecting clients cannot create two pools.
-  if (process.env.ZCODE_SUBAGENTS_LOCKED !== '1') throw new Error('Launch the supervisor through the MCP client.');
+  if (process.env.ZCODE_SUBAGENTS_LOCKED !== '1') throw new Error('Launch the supervisor through the plugin command.');
   await privateDir(lockPath);
   await atomicJson(path.join(lockPath, 'owner.json'), {
     pid: process.pid, identity: await processIdentity(process.pid), version: VERSION,
@@ -54,15 +53,18 @@ export async function startDaemon(config = settings()) {
           break;
         }
         case 'zcode_doctor': {
-          let cli;
+          let appServer;
           try {
-            const { stdout } = await execute(config.binary, ['--version'], { timeout: 15000, maxBuffer: 8192 });
-            cli = { available: true, version: stdout.trim() };
-          } catch (error) { cli = { available: false, error: error.message }; }
+            const runtime = await desktopRuntime(config);
+            const host = await ensureHost(config);
+            appServer = { available: true, runtime, ...host, ...(await hostCall(config, 'models')) };
+          } catch (error) { appServer = { available: false, error: error.message }; }
           result = { version: VERSION, concurrency: config.concurrency, hard_limit: 12,
-            cli: { command: config.binary, ...cli }, data_directory: config.home,
+            backend: 'desktop-app-server', appServer, data_directory: config.home,
             wait: { default_ms: 900000, min_ms: 600000, max_ms: 1800000, slice_ms: 20000 } };
+          break;
         }
+        case 'zcode_models': await ensureHost(config); result = await hostCall(config, 'models'); break;
       }
       res.end(JSON.stringify({ result }));
     } catch (error) {

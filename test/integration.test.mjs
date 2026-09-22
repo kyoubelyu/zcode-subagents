@@ -8,12 +8,15 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { Supervisor } from '../src/supervisor.mjs';
 import { settings, TERMINAL, delay, processIdentity, atomicJson } from '../src/common.mjs';
-import { OutputParser } from '../src/output.mjs';
+import { fixtureRuntime, stopHost } from './helpers.mjs';
+import { hostHealth, hostCall } from '../src/host-client.mjs';
+import { Frames, frame } from '../src/host-wire.mjs';
 import { validate } from '../src/schemas.mjs';
+import { SnapshotAssembly } from '../src/conversation.mjs';
+import { crc32 } from 'node:zlib';
 
 const execute = promisify(execFile);
-const fixture = fileURLToPath(new URL('./fixture-zcode.mjs', import.meta.url));
-await fs.chmod(fixture, 0o755);
+
 async function until(fn, timeout = 15000) {
   const end = Date.now() + timeout;
   while (Date.now() < end) { const value = await fn(); if (value) return value; await delay(100); }
@@ -23,13 +26,14 @@ async function setup(t, concurrency = 12) {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'zsa-test-'));
   const workspace = path.join(home, 'project');
   await fs.mkdir(workspace);
-  const config = { home, concurrency, binary: fixture };
+  const config = settings({ ZCODE_SUBAGENTS_HOME: home, ZCODE_SUBAGENTS_CONCURRENCY: String(concurrency), ZCODE_SUBAGENTS_RUNTIME_ROOT: await fixtureRuntime(home) });
   let supervisor = new Supervisor(config);
   await supervisor.init();
   t.after(async () => {
     for (const task of await supervisor.list()) if (!TERMINAL.has(task.status)) await supervisor.cancel(task.task_id);
     await until(async () => (await supervisor.list()).every((task) => TERMINAL.has(task.status)));
     await supervisor.close();
+    await stopHost(config);
     await fs.rm(home, { recursive: true, force: true });
   });
   return { home, workspace, config, get manager() { return supervisor; },
@@ -95,16 +99,16 @@ test('edit worktrees isolate main checkout and collect tracked and untracked cha
   assert.equal(await fs.readFile(path.join(ctx.workspace, 'dirty.txt'), 'utf8'), 'keep me');
 });
 
-test('cancel terminates the model process group including a spawned child', async (t) => {
+test('cancel stops only its session; another task and the shared Host survive', async (t) => {
   const ctx = await setup(t);
-  const task = await ctx.manager.spawn(input(ctx, 'child', '[fixture:child] [fixture:sleep=30000]'));
-  const pid = await until(async () => {
-    try { return Number(await fs.readFile(path.join(ctx.workspace, 'grandchild.pid'), 'utf8')); } catch { return false; }
-  });
-  assert.ok(await processIdentity(pid));
+  const task = await ctx.manager.spawn(input(ctx, 'cancel', '[fixture:sleep=30000]'));
+  const other = await ctx.manager.spawn(input(ctx, 'other', '[fixture:sleep=2000]'));
+  await until(async () => (await ctx.manager.status(task.task_id)).status === 'running');
+  const before = await hostHealth(ctx.config);
   await ctx.manager.cancel(task.task_id);
   assert.equal((await done(ctx, task.task_id)).status, 'cancelled');
-  await until(async () => !await processIdentity(pid));
+  assert.equal((await done(ctx, other.task_id)).status, 'succeeded');
+  assert.equal((await hostHealth(ctx.config)).hostPid, before.hostPid);
 });
 
 test('wait deadlines survive slices, do not stop tasks, and runtime deadlines are separate', async (t) => {
@@ -126,45 +130,114 @@ test('wait deadlines survive slices, do not stop tasks, and runtime deadlines ar
   assert.match(result.error, /deadline/);
 });
 
-test('failed exits and missing result frames are never reported as success; shell input is literal', async (t) => {
+test('model validation, provider errors, and literal prompt transport', async (t) => {
   const ctx = await setup(t);
   const fail = await ctx.manager.spawn(input(ctx, 'fail', '[fixture:fail]'));
-  const noSummary = await ctx.manager.spawn(input(ctx, 'no-summary', '[fixture:nosummary]'));
-  assert.equal((await done(ctx, fail.task_id)).exitCode, 7);
-  assert.equal((await done(ctx, noSummary.task_id)).status, 'failed');
+  assert.equal((await done(ctx, fail.task_id)).status, 'failed');
+  const bad = await ctx.manager.spawn({ ...input(ctx, 'bad'), model: { providerId: 'fixture', modelId: 'missing' } });
+  const badResult = await done(ctx, bad.task_id);
+  assert.match(badResult.error, /unavailable/);
+  assert.equal(badResult.sessionId, undefined);
+  const invalidReasoning = await ctx.manager.spawn({ ...input(ctx, 'bad-reasoning'), model: { providerId: 'fixture', modelId: 'default', options: { reasoningLevel: 'bogus' } } });
+  assert.match((await done(ctx, invalidReasoning.task_id)).error, /reasoning-level-not-supported/);
   const sentinel = path.join(ctx.workspace, 'should-not-exist');
   const prompt = '[fixture:args] $(touch ' + sentinel + ') ; echo bad';
   const literal = await ctx.manager.spawn(input(ctx, 'literal', prompt));
   assert.equal((await done(ctx, literal.task_id)).status, 'succeeded');
   const args = JSON.parse(await fs.readFile(path.join(ctx.workspace, 'arguments.json'), 'utf8'));
-  assert.ok(args[args.indexOf('--prompt') + 1].includes(prompt));
-  assert.ok(args[args.indexOf('--disallowed-tools') + 1].split(',').includes('Bash'));
+  assert.ok(args.envelope.payload.text.includes(prompt));
+  assert.ok(args.create.toolDenylist.includes('Bash'));
+  assert.ok(args.create.toolAllowlist.includes('Read'));
+  assert.ok(!args.create.toolAllowlist.includes('Write'));
+  assert.ok(!args.create.toolAllowlist.includes('Agent'));
+  assert.equal(args.envelope.payload.planEnabled, true);
   await assert.rejects(fs.access(sentinel));
 });
 
-test('a crashed worker is marked interrupted and its live child is cleaned up without replay', async (t) => {
+test('default routing, explicit override, followup inheritance and Host reuse', async (t) => {
+  const ctx = await setup(t);
+  const a = await ctx.manager.spawn(input(ctx, 'default'));
+  const first = await done(ctx, a.task_id);
+  assert.equal(first.effectiveModel.modelId, 'default');
+  const b = await ctx.manager.spawn({ ...input(ctx, 'explicit'), model: { providerId: 'fixture', modelId: 'explicit', options: { reasoningLevel: 'low' } } });
+  const second = await done(ctx, b.task_id);
+  assert.equal(second.effectiveModel.modelId, 'explicit');
+  assert.equal(second.observedModel.modelId, 'explicit');
+  assert.equal(second.appServer.instance, first.appServer.instance);
+  const c = await ctx.manager.followup(validate('zcode_followup', { task_id: b.task_id, request_key: 'continue', prompt: 'continue' }));
+  const third = await done(ctx, c.task_id);
+  assert.deepEqual(third.effectiveModel, second.effectiveModel);
+  assert.equal(third.sessionId, second.sessionId);
+  const d = await ctx.manager.followup(validate('zcode_followup', { task_id: c.task_id, request_key: 'reset-default', prompt: 'continue', model: 'default' }));
+  assert.equal((await done(ctx, d.task_id)).effectiveModel.modelId, 'default');
+  assert.equal((await hostCall(ctx.config, 'models')).defaultModel.modelId, 'default');
+});
+
+test('a crashed worker stops its session without killing the shared Host or replaying', async (t) => {
   const ctx = await setup(t);
   const task = await ctx.manager.spawn(input(ctx, 'crash', '[fixture:sleep=30000]'));
   await until(async () => (await ctx.manager.status(task.task_id)).status === 'running');
   const dir = path.join(ctx.home, 'tasks', task.task_id);
   const owner = JSON.parse(await fs.readFile(path.join(dir, 'owner.json'), 'utf8'));
-  const child = JSON.parse(await fs.readFile(path.join(dir, 'child.json'), 'utf8'));
+  const before = await hostHealth(ctx.config);
   process.kill(owner.pid, 'SIGKILL');
   const result = await done(ctx, task.task_id);
   assert.equal(result.status, 'interrupted');
-  assert.equal(await processIdentity(child.pid), undefined);
+  assert.equal((await hostHealth(ctx.config)).hostPid, before.hostPid);
   assert.equal((await ctx.manager.list()).length, 1);
 });
 
-test('stream parser handles fragmented JSON and ignores non-JSON diagnostics', () => {
-  const parser = new OutputParser();
-  parser.accept('diagnostic\n{"session');
-  parser.accept('Id":"sess_test","type":"event"}\n{"type":"result","response":"ok",');
-  parser.accept('"sessionId":"sess_test","usage":{"inputTokens":5}}\n');
-  parser.finish();
-  assert.equal(parser.summary.response, 'ok');
-  assert.equal(parser.sessionId, 'sess_test');
-  assert.equal(parser.summary.usage.inputTokens, 5);
+test('worker exit between scheduler reads preserves the committed terminal result', async (t) => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'zsa-exit-race-'));
+  t.after(() => fs.rm(home, { recursive: true, force: true }));
+  const config = settings({ ZCODE_SUBAGENTS_HOME: home });
+  const manager = new Supervisor(config);
+  const id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+  const dir = path.join(home, 'tasks', id);
+  const spec = { id, createdAt: new Date().toISOString() };
+  await atomicJson(path.join(dir, 'spec.json'), spec);
+  const final = { status: 'succeeded', response: 'Committed before worker exit' };
+  await atomicJson(path.join(dir, 'runtime.json'), final);
+  const original = manager.task.bind(manager);
+  let reads = 0;
+  manager.task = async (taskId) => ++reads === 1 ? { spec, dir, state: { status: 'running', startedAt: '2000-01-01T00:00:00Z' } } : original(taskId);
+  await manager.tick();
+  assert.deepEqual(JSON.parse(await fs.readFile(path.join(dir, 'runtime.json'), 'utf8')), final);
+});
+
+test('Host framing accepts fragmented and concatenated messages and rejects oversized frames', () => {
+  const frames = new Frames(); const values = [];
+  const msg = frame([201, 7], { text: '中文', count: 4 });
+  frames.accept(msg.subarray(0, 8), (...v) => values.push(v));
+  assert.equal(values.length, 0);
+  frames.accept(Buffer.concat([msg.subarray(8), msg]), (...v) => values.push(v));
+  assert.deepEqual(values, [[[201, 7], { text: '中文', count: 4 }], [[201, 7], { text: '中文', count: 4 }]]);
+  const invalid = Buffer.alloc(13); invalid.writeUInt32BE(32 * 1024 * 1024, 9);
+  assert.throws(() => frames.accept(invalid, () => {}), /too large/);
+});
+
+test('a Host crash fails accepted work without replay and the next task starts a new Host', async (t) => {
+  const ctx = await setup(t);
+  const task = await ctx.manager.spawn(input(ctx, 'host-crash', '[fixture:crash]'));
+  const result = await done(ctx, task.task_id);
+  assert.equal(result.status, 'failed');
+  const next = await ctx.manager.spawn(input(ctx, 'after-host-crash'));
+  const recovered = await done(ctx, next.task_id);
+  assert.equal(recovered.status, 'succeeded');
+  assert.notEqual(recovered.appServer.instance, result.appServer.instance);
+  assert.equal((await ctx.manager.list()).length, 2);
+});
+
+test('V4 snapshot assembly verifies fragmented payloads, identity and checksum', () => {
+  const topic = 'conversation/test', subscriptionId = 'sub1';
+  const frame = { topic, subscriptionId, toSeq: 3, payload: { kind: 'snapshot', snapshot: { protocolVersion: 1, seq: 3, control: {}, rows: { window: [] } } } };
+  const bytes = Buffer.from(JSON.stringify(frame));
+  const base = { topic, subscriptionId, wireVersion: 3, kind: 'fragment', deliveryKind: 'initial', logicalFrameId: 'f1', fragmentCount: 2,
+    logicalBytes: bytes.length, checksum: { algorithm: 'crc32', value: crc32(bytes).toString(16).padStart(8, '0') } };
+  const assembly = new SnapshotAssembly(topic);
+  assert.equal(assembly.accept({ ...base, fragmentIndex: 1, dataBase64: bytes.subarray(50).toString('base64') }), undefined);
+  assert.equal(assembly.accept({ ...base, fragmentIndex: 0, dataBase64: bytes.subarray(0, 50).toString('base64') }).snapshot.seq, 3);
+  assert.throws(() => new SnapshotAssembly(topic).accept({ ...base, fragmentCount: 1, fragmentIndex: 0, checksum: { algorithm: 'crc32', value: '00000000' }, dataBase64: bytes.toString('base64') }), /checksum/);
 });
 
 test('configuration rejects exceeding 12, traversal and invalid wait windows', () => {

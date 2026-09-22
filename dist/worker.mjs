@@ -1,11 +1,9 @@
 import { createRequire as __createRequire } from "node:module"; const require = __createRequire(import.meta.url);
 
 // src/worker.mjs
-import { promises as fs3, createWriteStream } from "node:fs";
-import { spawn } from "node:child_process";
-import { finished } from "node:stream/promises";
-import path3 from "node:path";
-import { fileURLToPath } from "node:url";
+import { promises as fs3 } from "node:fs";
+import path4 from "node:path";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/common.mjs
 import { promises as fs } from "node:fs";
@@ -19,11 +17,17 @@ function settings(env = process.env) {
   if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > MAX_CONCURRENCY) {
     throw new Error("ZCODE_SUBAGENTS_CONCURRENCY must be an integer from 1 to 12.");
   }
-  if (process.platform !== "linux") throw new Error("Version 0.1 supports Linux (including WSL) only.");
+  if (process.platform !== "linux") throw new Error("This release supports Linux (including WSL) only.");
   const socket = path.join(home, "supervisor.sock");
   if (Buffer.byteLength(socket) > 100) throw new Error("ZCODE_SUBAGENTS_HOME is too long for a Unix socket.");
-  return { home, socket, concurrency, binary: env.ZCODE_SUBAGENTS_BIN || "zcode" };
+  return {
+    home,
+    socket,
+    concurrency,
+    runtimeRoot: path.resolve(env.ZCODE_SUBAGENTS_RUNTIME_ROOT || path.join(os.homedir(), ".zcode/server"))
+  };
 }
+var delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 var now = () => (/* @__PURE__ */ new Date()).toISOString();
 function validId(id) {
   if (typeof id !== "string" || !/^[a-f0-9-]{36}$/.test(id)) throw new Error("Invalid task or wait ID.");
@@ -63,6 +67,9 @@ async function processIdentity(pid) {
     return void 0;
   }
 }
+async function sameProcess(owner) {
+  return Boolean(owner?.pid && owner?.identity && await processIdentity(owner.pid) === owner.identity);
+}
 function bounded(value, length = 12e3) {
   const text = typeof value === "string" ? value : JSON.stringify(value);
   return text?.length > length ? text.slice(0, length) + "\n[Truncated; see task artifacts.]" : text;
@@ -100,238 +107,237 @@ async function collectChanges(spec, workspace, dir) {
   };
 }
 
-// src/output.mjs
-var OutputParser = class {
-  constructor() {
-    this.buffer = "";
-    this.summary = void 0;
-    this.sessionId = void 0;
-    this.eventCount = 0;
-    this.lastEvent = void 0;
+// src/host-client.mjs
+import { spawn } from "node:child_process";
+import { openSync, closeSync } from "node:fs";
+import path3 from "node:path";
+import { fileURLToPath } from "node:url";
+
+// src/client.mjs
+import http from "node:http";
+function request(config, method, params, health = false) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      socketPath: config.socket,
+      path: health ? "/health" : "/rpc",
+      method: health ? "GET" : "POST",
+      headers: { "Content-Type": "application/json" }
+    }, (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {
+        body += chunk;
+        if (body.length > 8 * 1024 * 1024) res.destroy(new Error("Supervisor response too large."));
+      });
+      res.on("error", reject);
+      res.on("end", () => {
+        try {
+          const data = JSON.parse(body);
+          if (data.error) reject(new Error(data.error));
+          else resolve(health ? data : data.result);
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    req.setTimeout(55e3, () => req.destroy(new Error("Supervisor request timed out. Query task status before retrying a mutation.")));
+    req.on("error", reject);
+    req.end(health ? void 0 : JSON.stringify({ method, params }));
+  });
+}
+
+// src/host-client.mjs
+var hostConfig = (config) => ({ ...config, socket: path3.join(config.home, "host.sock") });
+var hostCall = (config, method, params = {}) => request(hostConfig(config), method, params);
+var hostHealth = (config) => request(hostConfig(config), null, null, true);
+async function ensureHost(config) {
+  let health;
+  try {
+    health = await hostHealth(config);
+  } catch {
   }
-  accept(data) {
-    this.buffer += data;
-    if (this.buffer.length > 4 * 1024 * 1024) throw new Error("ZCode emitted an oversized output frame.");
-    let newline;
-    while ((newline = this.buffer.indexOf("\n")) >= 0) {
-      const line = this.buffer.slice(0, newline);
-      this.buffer = this.buffer.slice(newline + 1);
-      this.line(line);
-    }
+  if (health) {
+    if (health.protocol !== 2) throw new Error("Incompatible app-server adapter; finish active tasks before replacing it.");
+    if (health.runtimeRoot !== config.runtimeRoot) throw new Error("Existing Host uses another runtime root. Finish tasks before changing the root.");
+    return health;
   }
-  line(line) {
-    if (!line.trim()) return;
-    let event;
+  await privateDir(config.home);
+  const log = openSync(path3.join(config.home, "host.log"), "a", 384);
+  try {
+    const child = spawn("flock", [
+      "--exclusive",
+      "--nonblock",
+      "--close",
+      path3.join(config.home, "host.flock"),
+      process.execPath,
+      fileURLToPath(new URL("./host.mjs", import.meta.url))
+    ], {
+      detached: true,
+      stdio: ["ignore", log, log],
+      env: {
+        ...process.env,
+        ZCODE_SUBAGENTS_HOME: config.home,
+        ZCODE_SUBAGENTS_RUNTIME_ROOT: config.runtimeRoot,
+        ZCODE_SUBAGENTS_HOST_LOCKED: "1"
+      }
+    });
+    child.on("error", () => {
+    });
+    child.unref();
+  } finally {
+    closeSync(log);
+  }
+  for (let i = 0; i < 220; i++) {
+    await delay(100);
     try {
-      event = JSON.parse(line);
+      health = await hostHealth(config);
     } catch {
-      return;
+      continue;
     }
-    if (!event || typeof event !== "object") return;
-    this.eventCount += 1;
-    this.lastEvent = event.type || event.event?.type || event.method || "json";
-    const id = event.sessionId || event.event?.sessionId || event.data?.sessionId || event.params?.sessionId;
-    if (typeof id === "string") this.sessionId = id;
-    if (event.type === "result" && typeof event.response === "string") this.summary = event;
+    if (health.protocol !== 2 || health.runtimeRoot !== config.runtimeRoot) throw new Error("An incompatible Host adapter is already running. Finish tasks before replacing it.");
+    return health;
   }
-  finish() {
-    this.line(this.buffer);
-    this.sessionId ||= this.summary?.sessionId;
-    this.buffer = "";
-  }
-};
+  throw new Error("Desktop Host did not start. Inspect " + path3.join(config.home, "host.log"));
+}
+
+// src/conversation.mjs
+var runningConversation = (snapshot) => snapshot.control.canStop || ["running", "prewarming"].includes(snapshot.control.phase);
+function turnResult(snapshot, commandId) {
+  const header = snapshot.rows.window.find((row) => row.kind === "turnHeader" && row.sourceCommandId === commandId);
+  if (!header || header.state === "running") return;
+  const response = snapshot.rows.window.filter((row) => row.kind === "assistantText" && row.turnId === header.turnId).map((row) => row.text).join("\n\n");
+  return { response, resultType: header.state, usage: snapshot.usage, error: snapshot.control.lastError };
+}
 
 // src/worker.mjs
+function taskPrompt(spec) {
+  return [
+    "You are a ZCode subagent delegated by Codex.",
+    "Do only the bounded task below. Do not create agents, workflows, or invoke other coding agents.",
+    "Do not publish, push, deploy, or merge. Bash and recursive delegation are disabled; do not bypass them.",
+    "Write tests if relevant and return commands for Codex to run. Do not claim unrun checks passed.",
+    spec.kind === "analysis" ? "Analysis only: do not edit any files." : "Edit only in this isolated worktree.",
+    "Return a concise summary, changes, actual checks, suggested commands and unresolved issues.",
+    "",
+    spec.prompt
+  ].join("\n");
+}
 async function runWorker(config, id) {
   process.umask(63);
   const dir = taskDir(config, id);
-  const lock = await fs3.open(path3.join(dir, "worker.lock"), "wx", 384);
-  await lock.close();
-  await atomicJson(path3.join(dir, "owner.json"), {
-    pid: process.pid,
-    identity: await processIdentity(process.pid)
-  });
-  const spec = await readJson(path3.join(dir, "spec.json"));
-  let runtime = { status: "preparing", startedAt: now(), updatedAt: now() };
-  let saveChain = Promise.resolve();
-  const save = () => {
-    const snapshot = { ...runtime, updatedAt: now() };
-    saveChain = saveChain.then(() => atomicJson(path3.join(dir, "runtime.json"), snapshot));
-    return saveChain;
-  };
-  await save();
-  let child;
-  let childOwner;
+  await (await fs3.open(path4.join(dir, "worker.lock"), "wx", 384)).close();
+  await atomicJson(path4.join(dir, "owner.json"), { pid: process.pid, identity: await processIdentity(process.pid) });
+  const spec = await readJson(path4.join(dir, "spec.json"));
+  const state = { status: "preparing", startedAt: now(), backend: "desktop-app-server", requestedModel: spec.model };
+  const save = () => atomicJson(path4.join(dir, "runtime.json"), { ...state, updatedAt: now() });
   let stopping;
-  let fatal;
-  let killTimer;
-  let monitor;
-  let monitoring = false;
-  const parser = new OutputParser();
-  const streams = [];
-  const groupSignal = async (signal) => {
-    if (!childOwner) return;
-    const identity = await processIdentity(childOwner.pid);
-    if (identity && identity !== childOwner.identity) return;
-    try {
-      process.kill(-childOwner.pid, signal);
-    } catch (e) {
-      if (e.code !== "ESRCH") throw e;
-    }
-  };
-  const stop = (reason, failed = false) => {
-    if (stopping) return;
-    stopping = reason;
-    if (failed) fatal ||= reason;
-    void groupSignal("SIGTERM");
-    killTimer = setTimeout(() => {
-      void groupSignal("SIGKILL");
-    }, 8e3);
-  };
-  process.once("SIGTERM", () => stop("Worker received SIGTERM"));
-  process.once("SIGINT", () => stop("Worker received SIGINT"));
+  process.once("SIGTERM", () => {
+    stopping = "Worker received SIGTERM";
+  });
+  process.once("SIGINT", () => {
+    stopping = "Worker received SIGINT";
+  });
+  const params = () => ({ instance: state.appServer.instance, workspacePath: state.workspace, sessionId: state.sessionId, runtimeIdentity: state.runtimeIdentity });
+  let accepted = false;
+  let terminal = false;
+  await save();
   try {
-    runtime.workspace = await prepareWorkspace(spec, dir);
-    if (await readJson(path3.join(dir, "cancel.json"))) {
-      runtime.status = "cancelled";
-      runtime.error = "Cancelled before execution";
+    state.workspace = await prepareWorkspace(spec, dir);
+    if (await readJson(path4.join(dir, "cancel.json"))) {
+      state.status = "cancelled";
       return;
     }
-    const permission = spec.kind === "analysis" ? "plan" : "edit";
-    const contract = [
-      "You are a ZCode subagent delegated by Codex.",
-      "Work only on the task below. Do not spawn agents, workflows, or invoke another coding agent CLI.",
-      "Stay within the supplied workspace and task scope. Do not publish, push, deploy, or merge.",
-      "Shell execution is unavailable in this headless permission mode. Bash is disabled; do not retry it or try to bypass it through another tool.",
-      "Write tests where relevant and return exact test commands for Codex to run. Never claim those commands have run.",
-      "Return a concise summary, changed files, checks actually run, suggested test commands, and unresolved issues.",
-      spec.kind === "analysis" ? "This is an analysis task; do not change files." : "Make changes only in this isolated worktree.",
-      "",
-      "Task:",
-      spec.prompt
-    ].join("\n");
-    const args = [
-      "--cwd",
-      runtime.workspace,
-      "--mode",
-      permission,
-      "--output-format",
-      "stream-json",
-      "--disallowed-tools",
-      "Agent,CreateWorkflow,AmendWorkflow,Bash",
-      "--prompt",
-      contract
-    ];
-    if (spec.sessionId) args.push("--resume", spec.sessionId);
-    child = spawn(config.binary, args, {
-      cwd: runtime.workspace,
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: true,
-      env: { ...process.env, ZCODE_SUBAGENTS_CHILD: "1" }
+    state.appServer = await ensureHost(config);
+    state.effectiveModel = await hostCall(config, "resolveModel", { model: spec.model, instance: state.appServer.instance });
+    const snapshot = await hostCall(config, spec.sessionId ? "resume" : "create", {
+      instance: state.appServer.instance,
+      workspacePath: state.workspace,
+      sessionId: spec.sessionId,
+      kind: spec.kind
     });
-    const completion = new Promise((resolve, reject) => {
-      child.once("error", reject);
-      child.once("close", (code2, signal2) => resolve({ code: code2, signal: signal2 }));
-    });
-    completion.catch(() => {
-    });
-    childOwner = { pid: child.pid, identity: await processIdentity(child.pid) };
-    await atomicJson(path3.join(dir, "child.json"), childOwner);
-    runtime.status = "running";
-    runtime.childPid = child.pid;
+    state.sessionId = snapshot.session.sessionId;
+    state.runtimeIdentity = await hostCall(config, "identity", params());
     await save();
-    let bytes = 0;
-    for (const [name, readable] of [["stdout", child.stdout], ["stderr", child.stderr]]) {
-      const output = createWriteStream(path3.join(dir, name + ".log"), { mode: 384 });
-      streams.push(output);
-      output.on("error", (error) => stop("Cannot write task log: " + error.message, true));
-      readable.setEncoding("utf8");
-      readable.on("data", (chunk) => {
-        bytes += Buffer.byteLength(chunk);
-        if (bytes > 64 * 1024 * 1024) {
-          stop("Task output exceeded the 64 MiB limit", true);
-          return;
-        }
-        if (!output.write(chunk)) {
-          readable.pause();
-          output.once("drain", () => readable.resume());
-        }
-        if (name === "stdout") {
-          try {
-            parser.accept(chunk);
-          } catch (error) {
-            stop(error.message, true);
-          }
-        } else {
-          runtime.stderrTail = (runtime.stderrTail || "") + chunk;
-          runtime.stderrTail = runtime.stderrTail.slice(-4e3);
-        }
-      });
-    }
-    monitor = setInterval(async () => {
-      if (monitoring) return;
-      monitoring = true;
-      try {
-        const cancel = await readJson(path3.join(dir, "cancel.json"));
-        if (cancel) stop(cancel.reason || "Cancelled by caller");
-        if (spec.runTimeoutMs && Date.now() - Date.parse(runtime.startedAt) >= spec.runTimeoutMs) {
-          stop("Execution deadline exceeded", true);
-        }
-        runtime.sessionId = parser.sessionId;
-        runtime.eventCount = parser.eventCount;
-        runtime.lastEvent = parser.lastEvent;
-        await save();
-      } catch (error) {
-        stop(error.message, true);
-      } finally {
-        monitoring = false;
+    const ack = await hostCall(config, "send", {
+      ...params(),
+      commandId: id,
+      kind: spec.kind,
+      model: state.effectiveModel,
+      prompt: taskPrompt(spec)
+    });
+    accepted = true;
+    state.commandAck = ack.status;
+    state.status = "running";
+    await save();
+    let stopSent = false, failure;
+    while (!terminal) {
+      const cancel = await readJson(path4.join(dir, "cancel.json"));
+      if (cancel) stopping ||= cancel.reason || "Cancelled by caller";
+      if (spec.runTimeoutMs && Date.now() - Date.parse(state.startedAt) >= spec.runTimeoutMs) {
+        failure ||= "Execution deadline exceeded";
+        stopping ||= failure;
       }
-    }, 500);
-    const { code, signal } = await completion;
-    clearInterval(monitor);
-    parser.finish();
-    runtime.exitCode = code;
-    runtime.signal = signal;
-    runtime.sessionId = parser.sessionId;
-    runtime.eventCount = parser.eventCount;
-    runtime.lastEvent = parser.lastEvent;
-    if (parser.summary) {
-      await atomicJson(path3.join(dir, "result.json"), parser.summary);
-      runtime.response = bounded(parser.summary.response);
-      runtime.usage = parser.summary.usage;
-      runtime.projection = parser.summary.projection;
+      if (stopping && !stopSent) {
+        await hostCall(config, "stop", { ...params(), commandId: id + "-stop" });
+        stopSent = true;
+      }
+      const current = await hostCall(config, "snapshot", { ...params(), commandId: id });
+      const result = turnResult(current, id);
+      if (result && !runningConversation(current)) {
+        if (result.resultType !== "completedSuccess" && !(stopping && result.resultType === "completedInterrupted")) failure ||= result.error?.message || "App-server turn ended: " + result.resultType;
+        if (result.resultType === "completedSuccess" && !result.response) failure ||= "App-server ended without an assistant response";
+        state.response = bounded(result.response);
+        state.usage = result.usage;
+        await atomicJson(path4.join(dir, "result.json"), { ...result, sessionId: state.sessionId, effectiveModel: state.effectiveModel });
+        terminal = true;
+      }
+      if (state.eventSeq !== current.seq) await fs3.appendFile(path4.join(dir, "progress.jsonl"), JSON.stringify({
+        at: now(),
+        seq: current.seq,
+        control: current.control,
+        model: current.config.modelSelection,
+        rows: current.rows.window.map((r) => ({ rowId: r.rowId, kind: r.kind, state: r.state, toolName: r.toolName }))
+      }) + "\n", { mode: 384 });
+      state.eventSeq = current.seq;
+      state.projection = current.control;
+      state.observedModel = current.config.modelSelection;
+      if (current.pendingInteractions?.length) {
+        failure ||= "App-server requires interaction; task stopped for review";
+        stopping ||= failure;
+      }
+      if (stopping && stopSent && !runningConversation(current)) terminal = true;
+      if (!terminal && current.control.phase === "error") throw new Error(current.control.lastError?.message || "App-server entered an error state");
+      await save();
+      if (!terminal) await delay(1e3);
     }
-    runtime.status = fatal ? "failed" : stopping ? "cancelled" : code === 0 && parser.summary && parser.summary.projection?.status !== "error" ? "succeeded" : "failed";
-    if (runtime.status !== "succeeded") {
-      runtime.error = fatal || stopping || (code !== 0 ? "ZCode exited with code " + code : "ZCode did not return a successful structured result");
-    }
-    try {
-      runtime.changes = await collectChanges(spec, runtime.workspace, dir);
-    } catch (error) {
-      runtime.status = "failed";
-      runtime.error = "Could not collect changes: " + error.message;
-    }
+    state.status = failure ? "failed" : stopping ? "cancelled" : "succeeded";
+    if (failure || stopping) state.error = failure || stopping;
+    state.changes = await collectChanges(spec, state.workspace, dir);
   } catch (error) {
-    runtime.status = stopping && !fatal ? "cancelled" : "failed";
-    runtime.error = error.message;
-    if (child?.pid) await groupSignal("SIGKILL");
+    state.error = error.message;
+    state.status = "failed";
+    if (state.sessionId && !terminal) {
+      try {
+        await hostCall(config, "stop", { ...params(), commandId: id + "-cleanup" });
+        const current = await hostCall(config, "snapshot", params());
+        if (runningConversation(current)) state.status = "cleanup_pending";
+      } catch {
+        if (await sameProcess({ pid: state.appServer.hostPid, identity: state.appServer.hostIdentity })) state.status = "cleanup_pending";
+      }
+    }
+    if (accepted && !terminal) state.submissionOutcome = "interrupted; not replayed";
   } finally {
-    clearInterval(monitor);
-    clearTimeout(killTimer);
-    if (stopping) await groupSignal("SIGKILL");
-    for (const stream of streams) stream.end();
-    await Promise.allSettled(streams.map((stream) => finished(stream)));
-    while (monitoring) await new Promise((resolve) => setTimeout(resolve, 10));
-    runtime.finishedAt = now();
+    if (state.status !== "cleanup_pending") state.finishedAt = now();
     await save();
   }
 }
-if (process.argv[1] && path3.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (process.argv[1] && path4.resolve(process.argv[1]) === fileURLToPath2(import.meta.url)) {
   runWorker(settings(), process.argv[2]).catch((error) => {
     console.error(error.message);
     process.exitCode = 1;
   });
 }
 export {
-  runWorker
+  runWorker,
+  taskPrompt
 };

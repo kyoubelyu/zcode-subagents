@@ -1,8 +1,8 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "zcode-subagents",
-  "version": "0.1.0+codex.20260922024859",
-  "description": "Let Codex orchestrate up to 12 persistent ZCode subagents with resumable sessions and isolated edit worktrees.",
+  "version": "0.2.0+codex.20260922154954",
+  "description": "Delegate to the installed ZCode Desktop app-server with explicit model routing and a shared 12-task limit.",
   "author": {
     "name": "kyoubelyu"
   },

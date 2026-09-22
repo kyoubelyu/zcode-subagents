@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 
-export const VERSION = '0.1.0';
+export const VERSION = '0.2.0';
 export const TERMINAL = new Set(['succeeded', 'failed', 'cancelled', 'interrupted']);
 export const MAX_CONCURRENCY = 12;
 export const WAIT_DEFAULT = 900000;
@@ -16,10 +16,11 @@ export function settings(env = process.env) {
   if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > MAX_CONCURRENCY) {
     throw new Error('ZCODE_SUBAGENTS_CONCURRENCY must be an integer from 1 to 12.');
   }
-  if (process.platform !== 'linux') throw new Error('Version 0.1 supports Linux (including WSL) only.');
+  if (process.platform !== 'linux') throw new Error('This release supports Linux (including WSL) only.');
   const socket = path.join(home, 'supervisor.sock');
   if (Buffer.byteLength(socket) > 100) throw new Error('ZCODE_SUBAGENTS_HOME is too long for a Unix socket.');
-  return { home, socket, concurrency, binary: env.ZCODE_SUBAGENTS_BIN || 'zcode' };
+  return { home, socket, concurrency,
+    runtimeRoot: path.resolve(env.ZCODE_SUBAGENTS_RUNTIME_ROOT || path.join(os.homedir(), '.zcode/server')) };
 }
 
 export const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));

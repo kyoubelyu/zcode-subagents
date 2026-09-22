@@ -6,7 +6,7 @@ import path from 'node:path';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const result = await build({
   absWorkingDir: root,
-  entryPoints: ['src/server.mjs', 'src/daemon.mjs', 'src/worker.mjs'],
+  entryPoints: ['src/control.mjs', 'src/daemon.mjs', 'src/worker.mjs', 'src/host.mjs'],
   outdir: 'dist', outExtension: { '.js': '.mjs' }, bundle: true, platform: 'node',
   format: 'esm', target: 'node22', minify: false, sourcemap: false,
   banner: { js: 'import { createRequire as __createRequire } from "node:module"; const require = __createRequire(import.meta.url);' },

@@ -48,7 +48,7 @@ export async function ensureDaemon(config = settings()) {
       fileURLToPath(new URL('./daemon.mjs', import.meta.url))], {
       detached: true, stdio: ['ignore', log, log],
       env: { ...process.env, ZCODE_SUBAGENTS_HOME: config.home,
-        ZCODE_SUBAGENTS_BIN: config.binary, ZCODE_SUBAGENTS_CONCURRENCY: String(config.concurrency),
+        ZCODE_SUBAGENTS_RUNTIME_ROOT: config.runtimeRoot, ZCODE_SUBAGENTS_CONCURRENCY: String(config.concurrency),
         ZCODE_SUBAGENTS_LOCKED: '1' },
     });
     daemon.on('error', () => {});

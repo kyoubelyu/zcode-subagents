@@ -5,29 +5,22 @@ var __export = (target, all) => {
     __defProp(target, name, { get: all[name], enumerable: true });
 };
 
-// src/daemon.mjs
-import http2 from "node:http";
-import { promises as fs5 } from "node:fs";
-import path5 from "node:path";
-import { fileURLToPath as fileURLToPath3 } from "node:url";
+// src/control.mjs
+import { promises as fs2 } from "node:fs";
 
-// src/supervisor.mjs
-import { promises as fs3, openSync as openSync2, closeSync as closeSync2 } from "node:fs";
-import { spawn as spawn2 } from "node:child_process";
-import path3 from "node:path";
-import { fileURLToPath as fileURLToPath2 } from "node:url";
+// src/client.mjs
+import http from "node:http";
+import { spawn } from "node:child_process";
+import { openSync, closeSync } from "node:fs";
+import path2 from "node:path";
+import { fileURLToPath } from "node:url";
 
 // src/common.mjs
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createHash, randomUUID } from "node:crypto";
 var VERSION = "0.2.0";
-var TERMINAL = /* @__PURE__ */ new Set(["succeeded", "failed", "cancelled", "interrupted"]);
 var MAX_CONCURRENCY = 12;
-var WAIT_DEFAULT = 9e5;
-var WAIT_MIN = 6e5;
-var WAIT_MAX = 18e5;
 function settings(env = process.env) {
   const home = path.resolve(env.ZCODE_SUBAGENTS_HOME || path.join(os.homedir(), ".local/share/zcode-subagents"));
   const concurrency = Number(env.ZCODE_SUBAGENTS_CONCURRENCY || MAX_CONCURRENCY);
@@ -45,84 +38,12 @@ function settings(env = process.env) {
   };
 }
 var delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-var newId = () => randomUUID();
-var now = () => (/* @__PURE__ */ new Date()).toISOString();
-var digest = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
-function validId(id2) {
-  if (typeof id2 !== "string" || !/^[a-f0-9-]{36}$/.test(id2)) throw new Error("Invalid task or wait ID.");
-  return id2;
-}
-var taskDir = (config2, id2) => path.join(config2.home, "tasks", validId(id2));
 async function privateDir(dir) {
   await fs.mkdir(dir, { recursive: true, mode: 448 });
   await fs.chmod(dir, 448);
 }
-async function atomicJson(file2, value) {
-  await privateDir(path.dirname(file2));
-  const temp = file2 + "." + randomUUID() + ".tmp";
-  try {
-    await fs.writeFile(temp, JSON.stringify(value, null, 2) + "\n", { mode: 384 });
-    await fs.rename(temp, file2);
-  } finally {
-    await fs.rm(temp, { force: true });
-  }
-}
-async function readJson(file2, fallback = void 0) {
-  try {
-    return JSON.parse(await fs.readFile(file2, "utf8"));
-  } catch (error62) {
-    if (error62.code === "ENOENT") return fallback;
-    throw error62;
-  }
-}
-async function processIdentity(pid) {
-  if (!Number.isSafeInteger(pid) || pid < 2) return void 0;
-  try {
-    const raw = await fs.readFile("/proc/" + pid + "/stat", "utf8");
-    const fields = raw.slice(raw.lastIndexOf(")") + 2).split(" ");
-    if (fields[0] === "Z") return void 0;
-    return fields[19];
-  } catch {
-    return void 0;
-  }
-}
-async function sameProcess(owner) {
-  return Boolean(owner?.pid && owner?.identity && await processIdentity(owner.pid) === owner.identity);
-}
-
-// src/workspace.mjs
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { promises as fs2 } from "node:fs";
-var execute = promisify(execFile);
-async function git(cwd, args, maxBuffer = 16 * 1024 * 1024) {
-  const { stdout } = await execute("git", ["-C", cwd, ...args], { maxBuffer, encoding: "utf8" });
-  return stdout;
-}
-async function inspectWorkspace(cwd, kind) {
-  const real = await fs2.realpath(cwd);
-  if (!(await fs2.stat(real)).isDirectory()) throw new Error("cwd must be a directory.");
-  if (kind === "analysis") return { cwd: real };
-  let root;
-  try {
-    root = (await git(real, ["rev-parse", "--show-toplevel"])).trim();
-  } catch {
-    throw new Error("Edit tasks require a Git repository with an existing commit.");
-  }
-  if ((await git(root, ["status", "--porcelain", "--untracked-files=normal"])).trim()) {
-    throw new Error("Edit tasks require a clean source repository. Commit the intended snapshot first; local changes are never silently omitted or stashed.");
-  }
-  return { cwd: real, repo: root, baseCommit: (await git(root, ["rev-parse", "HEAD"])).trim() };
-}
-
-// src/host-client.mjs
-import { spawn } from "node:child_process";
-import { openSync, closeSync } from "node:fs";
-import path2 from "node:path";
-import { fileURLToPath } from "node:url";
 
 // src/client.mjs
-import http from "node:http";
 function request(config2, method, params, health = false) {
   return new Promise((resolve, reject) => {
     const req = http.request({
@@ -153,32 +74,28 @@ function request(config2, method, params, health = false) {
     req.end(health ? void 0 : JSON.stringify({ method, params }));
   });
 }
-
-// src/host-client.mjs
-var hostConfig = (config2) => ({ ...config2, socket: path2.join(config2.home, "host.sock") });
-var hostCall = (config2, method, params = {}) => request(hostConfig(config2), method, params);
-var hostHealth = (config2) => request(hostConfig(config2), null, null, true);
-async function ensureHost(config2) {
+async function ensureDaemon(config2 = settings()) {
+  if (process.env.ZCODE_SUBAGENTS_CHILD === "1") throw new Error("Recursive ZCode delegation is disabled.");
   let health;
   try {
-    health = await hostHealth(config2);
+    health = await request(config2, void 0, void 0, true);
   } catch {
   }
   if (health) {
-    if (health.protocol !== 2) throw new Error("Incompatible app-server adapter; finish active tasks before replacing it.");
-    if (health.runtimeRoot !== config2.runtimeRoot) throw new Error("Existing Host uses another runtime root. Finish tasks before changing the root.");
-    return health;
+    if (health.version !== VERSION) throw new Error("A different supervisor version is running. Finish tasks and stop it before upgrading.");
+    if (health.concurrency !== config2.concurrency) throw new Error("The shared supervisor has a different concurrency setting. Finish tasks and stop it before reconfiguring.");
+    return config2;
   }
   await privateDir(config2.home);
-  const log = openSync(path2.join(config2.home, "host.log"), "a", 384);
+  const log = openSync(path2.join(config2.home, "supervisor.log"), "a", 384);
   try {
-    const child = spawn("flock", [
+    const daemon = spawn("flock", [
       "--exclusive",
       "--nonblock",
       "--close",
-      path2.join(config2.home, "host.flock"),
+      path2.join(config2.home, "supervisor.flock"),
       process.execPath,
-      fileURLToPath(new URL("./host.mjs", import.meta.url))
+      fileURLToPath(new URL("./daemon.mjs", import.meta.url))
     ], {
       detached: true,
       stdio: ["ignore", log, log],
@@ -186,324 +103,31 @@ async function ensureHost(config2) {
         ...process.env,
         ZCODE_SUBAGENTS_HOME: config2.home,
         ZCODE_SUBAGENTS_RUNTIME_ROOT: config2.runtimeRoot,
-        ZCODE_SUBAGENTS_HOST_LOCKED: "1"
+        ZCODE_SUBAGENTS_CONCURRENCY: String(config2.concurrency),
+        ZCODE_SUBAGENTS_LOCKED: "1"
       }
     });
-    child.on("error", () => {
+    daemon.on("error", () => {
     });
-    child.unref();
+    daemon.unref();
   } finally {
     closeSync(log);
   }
-  for (let i = 0; i < 220; i++) {
+  for (let i = 0; i < 50; i++) {
     await delay(100);
     try {
-      health = await hostHealth(config2);
+      health = await request(config2, void 0, void 0, true);
+      if (health.version !== VERSION || health.concurrency !== config2.concurrency) {
+        throw new Error("Supervisor configuration mismatch.");
+      }
+      return config2;
     } catch {
-      continue;
     }
-    if (health.protocol !== 2 || health.runtimeRoot !== config2.runtimeRoot) throw new Error("An incompatible Host adapter is already running. Finish tasks before replacing it.");
-    return health;
   }
-  throw new Error("Desktop Host did not start. Inspect " + path2.join(config2.home, "host.log"));
+  throw new Error("Supervisor did not start. Inspect " + path2.join(config2.home, "supervisor.log"));
 }
-
-// src/conversation.mjs
-var runningConversation = (snapshot) => snapshot.control.canStop || ["running", "prewarming"].includes(snapshot.control.phase);
-
-// src/supervisor.mjs
-var workerPath = fileURLToPath2(new URL("./worker.mjs", import.meta.url));
-var active = (state) => ["starting", "preparing", "running", "cleanup_pending"].includes(state);
-var Supervisor = class {
-  constructor(config2) {
-    this.config = config2;
-    this.tickBusy = false;
-    this.mutations = Promise.resolve();
-  }
-  async init() {
-    await privateDir(path3.join(this.config.home, "tasks"));
-    await privateDir(path3.join(this.config.home, "waits"));
-    await this.tick();
-    this.timer = setInterval(() => {
-      this.tick().catch((e) => console.error(e.message));
-    }, 300);
-  }
-  async close() {
-    this.closed = true;
-    clearInterval(this.timer);
-    while (this.tickBusy) await delay(10);
-  }
-  mutate(fn) {
-    const next = this.mutations.then(fn);
-    this.mutations = next.catch(() => {
-    });
-    return next;
-  }
-  async ids() {
-    return (await fs3.readdir(path3.join(this.config.home, "tasks"))).filter((id2) => /^[a-f0-9-]{36}$/.test(id2));
-  }
-  async task(id2) {
-    const dir = taskDir(this.config, id2);
-    const spec = await readJson(path3.join(dir, "spec.json"));
-    if (!spec) throw new Error("Task not found: " + id2);
-    const state = await readJson(path3.join(dir, "runtime.json"), { status: "queued" });
-    return { spec, state, dir };
-  }
-  async status(id2) {
-    const { spec, state, dir } = await this.task(id2);
-    return {
-      task_id: id2,
-      workflow_id: spec.workflowId,
-      kind: spec.kind,
-      parent_task_id: spec.parentTaskId,
-      created_at: spec.createdAt,
-      ...state,
-      artifacts: {
-        directory: dir,
-        worker: path3.join(dir, "worker.log"),
-        ...state.backend === "desktop-app-server" ? { progress: path3.join(dir, "progress.jsonl") } : { stdout: path3.join(dir, "stdout.log"), stderr: path3.join(dir, "stderr.log") },
-        result: path3.join(dir, "result.json")
-      }
-    };
-  }
-  async list(workflowId) {
-    const rows = [];
-    for (const id2 of await this.ids()) {
-      const row = await this.status(id2);
-      if (!workflowId || row.workflow_id === workflowId) rows.push(row);
-    }
-    return rows.sort((a, b) => a.created_at.localeCompare(b.created_at));
-  }
-  async spawn(input2) {
-    return this.mutate(async () => {
-      const requestHash = digest(input2);
-      for (const id3 of await this.ids()) {
-        const { spec: spec2 } = await this.task(id3);
-        if (spec2.workflowId === input2.workflow_id && spec2.requestKey === input2.request_key) {
-          if (spec2.requestHash !== requestHash) throw new Error("request_key already belongs to a different request.");
-          return this.status(id3);
-        }
-      }
-      const context = await inspectWorkspace(input2.cwd, input2.kind);
-      const id2 = newId();
-      const spec = {
-        id: id2,
-        workflowId: input2.workflow_id,
-        requestKey: input2.request_key,
-        requestHash,
-        prompt: input2.prompt,
-        kind: input2.kind,
-        runTimeoutMs: input2.run_timeout_ms || 0,
-        model: input2.model,
-        createdAt: now(),
-        ...context
-      };
-      await atomicJson(path3.join(taskDir(this.config, id2), "spec.json"), spec);
-      return this.status(id2);
-    });
-  }
-  async followup(input2) {
-    return this.mutate(async () => {
-      const parent = await this.task(input2.task_id);
-      const requestHash = digest(input2);
-      for (const id3 of await this.ids()) {
-        const { spec: spec2 } = await this.task(id3);
-        if (spec2.workflowId === parent.spec.workflowId && spec2.requestKey === input2.request_key) {
-          if (spec2.requestHash !== requestHash) throw new Error("request_key already belongs to a different request.");
-          return this.status(id3);
-        }
-      }
-      for (const id3 of await this.ids()) {
-        if ((await this.task(id3)).spec.parentTaskId === input2.task_id) {
-          throw new Error("This task already has a followup. Continue from that task instead.");
-        }
-      }
-      const id2 = newId();
-      const spec = {
-        ...parent.spec,
-        id: id2,
-        parentTaskId: input2.task_id,
-        requestKey: input2.request_key,
-        requestHash,
-        prompt: input2.prompt,
-        createdAt: now(),
-        sessionId: void 0,
-        workspace: void 0,
-        runTimeoutMs: input2.run_timeout_ms || 0,
-        model: input2.model
-      };
-      await atomicJson(path3.join(taskDir(this.config, id2), "spec.json"), spec);
-      return this.status(id2);
-    });
-  }
-  async cancel(id2) {
-    const task = await this.task(id2);
-    if (TERMINAL.has(task.state.status)) return this.status(id2);
-    await atomicJson(path3.join(task.dir, "cancel.json"), { reason: "Cancelled by caller", at: now() });
-    await this.tick();
-    return this.status(id2);
-  }
-  async tick() {
-    if (this.closed || this.tickBusy) return;
-    this.tickBusy = true;
-    try {
-      const tasks = await Promise.all((await this.ids()).map((id2) => this.task(id2)));
-      let count = 0;
-      const busyWorkspaces = /* @__PURE__ */ new Set();
-      for (const task of tasks) {
-        if (!active(task.state.status)) continue;
-        const owner = await readJson(path3.join(task.dir, "owner.json"));
-        if (await sameProcess(owner) || !owner && Date.now() - Date.parse(task.state.startedAt) < 1e4) {
-          count++;
-          if (task.state.workspace) busyWorkspaces.add(task.state.workspace);
-        } else {
-          task.state = (await this.task(task.spec.id)).state;
-          if (!active(task.state.status)) continue;
-          if (task.state.appServer) {
-            const host = task.state.appServer;
-            if (await sameProcess({ pid: host.hostPid, identity: host.hostIdentity })) {
-              try {
-                const params = { instance: host.instance, workspacePath: task.state.workspace, sessionId: task.state.sessionId };
-                await hostCall(this.config, "stop", params);
-                const snapshot = await hostCall(this.config, "snapshot", params);
-                if (runningConversation(snapshot)) {
-                  count++;
-                  continue;
-                }
-              } catch {
-                count++;
-                if (task.state.status !== "cleanup_pending") await atomicJson(path3.join(task.dir, "runtime.json"), {
-                  ...task.state,
-                  status: "cleanup_pending",
-                  error: "Worker stopped; waiting to confirm its app-server session has stopped."
-                });
-                continue;
-              }
-            }
-          }
-          const child = await readJson(path3.join(task.dir, "child.json"));
-          if (await sameProcess(child)) {
-            task.state.orphanedAt ||= now();
-            await atomicJson(path3.join(task.dir, "runtime.json"), task.state);
-            const signal = Date.now() - Date.parse(task.state.orphanedAt) > 8e3 ? "SIGKILL" : "SIGTERM";
-            try {
-              process.kill(-child.pid, signal);
-            } catch {
-            }
-            count++;
-            continue;
-          }
-          if (child?.pid && !await processIdentity(child.pid)) {
-            try {
-              process.kill(-child.pid, "SIGKILL");
-            } catch {
-            }
-          }
-          task.state = {
-            ...task.state,
-            status: "interrupted",
-            finishedAt: now(),
-            error: task.state.error || "Worker exited without a final result. Inspect artifacts before explicitly retrying."
-          };
-          await atomicJson(path3.join(task.dir, "runtime.json"), task.state);
-        }
-      }
-      tasks.sort((a, b) => a.spec.createdAt.localeCompare(b.spec.createdAt));
-      for (const task of tasks) {
-        if (task.state.status !== "queued") continue;
-        if (await readJson(path3.join(task.dir, "cancel.json"))) {
-          await atomicJson(path3.join(task.dir, "runtime.json"), { status: "cancelled", finishedAt: now() });
-          continue;
-        }
-        if (count >= this.config.concurrency) continue;
-        if (task.spec.parentTaskId) {
-          const parent = await this.task(task.spec.parentTaskId);
-          if (!TERMINAL.has(parent.state.status)) continue;
-          if (!parent.state.sessionId || !parent.state.workspace) {
-            await atomicJson(path3.join(task.dir, "runtime.json"), {
-              status: "failed",
-              finishedAt: now(),
-              error: "Parent task has no resumable session."
-            });
-            continue;
-          }
-          task.spec.sessionId = parent.state.sessionId;
-          task.spec.workspace = parent.state.workspace;
-          task.spec.model ??= parent.state.effectiveModel || parent.spec.model;
-          await atomicJson(path3.join(task.dir, "spec.json"), task.spec);
-        }
-        if (task.spec.workspace && busyWorkspaces.has(task.spec.workspace)) continue;
-        await atomicJson(path3.join(task.dir, "runtime.json"), {
-          status: "starting",
-          startedAt: now(),
-          workspace: task.spec.workspace
-        });
-        const log = openSync2(path3.join(task.dir, "worker.log"), "a", 384);
-        try {
-          const worker = spawn2(process.execPath, [workerPath, task.spec.id], {
-            env: {
-              ...process.env,
-              ZCODE_SUBAGENTS_HOME: this.config.home,
-              ZCODE_SUBAGENTS_RUNTIME_ROOT: this.config.runtimeRoot
-            },
-            stdio: ["ignore", log, log],
-            detached: true
-          });
-          worker.once("error", (error62) => {
-            atomicJson(path3.join(task.dir, "runtime.json"), {
-              status: "failed",
-              error: error62.message,
-              finishedAt: now()
-            }).catch(console.error);
-          });
-          worker.unref();
-        } finally {
-          closeSync2(log);
-        }
-        count++;
-        if (task.spec.workspace) busyWorkspaces.add(task.spec.workspace);
-      }
-    } finally {
-      this.tickBusy = false;
-    }
-  }
-  async wait(input2, sliceMs = 2e4) {
-    let wait;
-    let id2 = input2.wait_id;
-    if (id2) {
-      wait = await readJson(path3.join(this.config.home, "waits", validWaitId(id2) + ".json"));
-      if (!wait) throw new Error("Wait not found.");
-    } else {
-      if (!input2.task_ids?.length) throw new Error("task_ids is required for a new wait.");
-      const timeout = input2.timeout_ms ?? WAIT_DEFAULT;
-      if (timeout < WAIT_MIN || timeout > WAIT_MAX) throw new Error("Wait timeout must be 10\u201330 minutes.");
-      for (const taskId of input2.task_ids) await this.task(taskId);
-      id2 = newId();
-      wait = { ids: input2.task_ids, mode: input2.mode || "all", deadline: Date.now() + timeout };
-      await atomicJson(path3.join(this.config.home, "waits", id2 + ".json"), wait);
-    }
-    const sliceEnd = Math.min(Date.now() + Math.min(sliceMs, 5e4), wait.deadline);
-    let tasks;
-    let ready;
-    do {
-      tasks = await Promise.all(wait.ids.map((taskId) => this.status(taskId)));
-      ready = wait.mode === "any" ? tasks.some((t) => TERMINAL.has(t.status)) : tasks.every((t) => TERMINAL.has(t.status));
-      if (ready || Date.now() >= sliceEnd) break;
-      await delay(Math.min(200, sliceEnd - Date.now()));
-    } while (true);
-    return {
-      wait_id: id2,
-      deadline: new Date(wait.deadline).toISOString(),
-      ready,
-      timed_out: !ready && Date.now() >= wait.deadline,
-      tasks,
-      instruction: ready ? "Inspect task results." : "Tasks continue running. Call zcode_wait with the same wait_id to preserve the deadline."
-    };
-  }
-};
-function validWaitId(id2) {
-  if (!/^[a-f0-9-]{36}$/.test(id2)) throw new Error("Invalid wait ID.");
-  return id2;
+async function call(method, params = {}) {
+  return request(await ensureDaemon(), method, params);
 }
 
 // node_modules/zod/v4/classic/external.js
@@ -1322,10 +946,10 @@ function mergeDefs(...defs) {
 function cloneDef(schema) {
   return mergeDefs(schema._zod.def);
 }
-function getElementAtPath(obj, path6) {
-  if (!path6)
+function getElementAtPath(obj, path3) {
+  if (!path3)
     return obj;
-  return path6.reduce((acc, key) => acc?.[key], obj);
+  return path3.reduce((acc, key) => acc?.[key], obj);
 }
 function promiseAllObject(promisesObj) {
   const keys = Object.keys(promisesObj);
@@ -1665,11 +1289,11 @@ function explicitlyAborted(x, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path6, issues) {
+function prefixIssues(path3, issues) {
   return issues.map((iss) => {
     var _a3;
     (_a3 = iss).path ?? (_a3.path = []);
-    iss.path.unshift(path6);
+    iss.path.unshift(path3);
     return iss;
   });
 }
@@ -2119,16 +1743,16 @@ function flattenError(error62, mapper = (issue2) => issue2.message) {
 }
 function formatError(error62, mapper = (issue2) => issue2.message) {
   const fieldErrors = { _errors: [] };
-  const processError = (error63, path6 = []) => {
+  const processError = (error63, path3 = []) => {
     for (const issue2 of error63.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
-        issue2.errors.map((issues) => processError({ issues }, [...path6, ...issue2.path]));
+        issue2.errors.map((issues) => processError({ issues }, [...path3, ...issue2.path]));
       } else if (issue2.code === "invalid_key") {
-        processError({ issues: issue2.issues }, [...path6, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
       } else if (issue2.code === "invalid_element") {
-        processError({ issues: issue2.issues }, [...path6, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
       } else {
-        const fullpath = [...path6, ...issue2.path];
+        const fullpath = [...path3, ...issue2.path];
         if (fullpath.length === 0) {
           fieldErrors._errors.push(mapper(issue2));
         } else {
@@ -2167,17 +1791,17 @@ function formatError(error62, mapper = (issue2) => issue2.message) {
 }
 function treeifyError(error62, mapper = (issue2) => issue2.message) {
   const result = { errors: [] };
-  const processError = (error63, path6 = []) => {
+  const processError = (error63, path3 = []) => {
     var _a3;
     for (const issue2 of error63.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
-        issue2.errors.map((issues) => processError({ issues }, [...path6, ...issue2.path]));
+        issue2.errors.map((issues) => processError({ issues }, [...path3, ...issue2.path]));
       } else if (issue2.code === "invalid_key") {
-        processError({ issues: issue2.issues }, [...path6, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
       } else if (issue2.code === "invalid_element") {
-        processError({ issues: issue2.issues }, [...path6, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
       } else {
-        const fullpath = [...path6, ...issue2.path];
+        const fullpath = [...path3, ...issue2.path];
         if (fullpath.length === 0) {
           result.errors.push(mapper(issue2));
           continue;
@@ -2216,8 +1840,8 @@ function treeifyError(error62, mapper = (issue2) => issue2.message) {
 }
 function toDotPath(_path) {
   const segs = [];
-  const path6 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
-  for (const seg of path6) {
+  const path3 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
+  for (const seg of path3) {
     if (typeof seg === "number")
       segs.push(`[${seg}]`);
     else if (typeof seg === "symbol")
@@ -19319,13 +18943,13 @@ function resolveRef(ref, ctx) {
   if (!ref.startsWith("#")) {
     throw new Error("External $ref is not supported, only local refs (#/...) are allowed");
   }
-  const path6 = ref.slice(1).split("/").filter(Boolean);
-  if (path6.length === 0) {
+  const path3 = ref.slice(1).split("/").filter(Boolean);
+  if (path3.length === 0) {
     return ctx.rootSchema;
   }
   const defsKey = ctx.version === "draft-2020-12" ? "$defs" : "definitions";
-  if (path6[0] === defsKey) {
-    const key = path6[1] === void 0 ? void 0 : decodeJSONPointerSegment(path6[1]);
+  if (path3[0] === defsKey) {
+    const key = path3[1] === void 0 ? void 0 : decodeJSONPointerSegment(path3[1]);
     if (!key || !ctx.defs[key]) {
       throw new Error(`Reference not found: ${ref}`);
     }
@@ -20223,143 +19847,28 @@ function validate2(method, params) {
   return input2;
 }
 
-// src/desktop-runtime.mjs
-import { promises as fs4 } from "node:fs";
-import path4 from "node:path";
-import os2 from "node:os";
-async function desktopRuntime(config2) {
-  const root = path4.resolve(config2.runtimeRoot || path4.join(os2.homedir(), ".zcode/server"));
-  const runtime = { root, node: path4.join(root, "node"), entry: path4.join(root, "zcode-server.cjs"), cwd: config2.home };
-  for (const file2 of [runtime.node, runtime.entry, path4.join(root, "agents/glm/zcode.cjs")]) {
-    try {
-      if (!(await fs4.stat(file2)).isFile()) throw new Error();
-    } catch {
-      throw new Error("Desktop runtime file missing: " + file2 + ". Install or repair ZCode Desktop yourself; this plugin never downloads or modifies it.");
-    }
-  }
-  return runtime;
-}
-
-// src/daemon.mjs
-async function startDaemon(config2 = settings()) {
-  process.umask(63);
-  await privateDir(config2.home);
-  const lockPath = path5.join(config2.home, "supervisor.lock");
-  if (process.env.ZCODE_SUBAGENTS_LOCKED !== "1") throw new Error("Launch the supervisor through the plugin command.");
-  await privateDir(lockPath);
-  await atomicJson(path5.join(lockPath, "owner.json"), {
-    pid: process.pid,
-    identity: await processIdentity(process.pid),
-    version: VERSION
-  });
-  await fs5.rm(config2.socket, { force: true });
-  const supervisor = new Supervisor(config2);
-  await supervisor.init();
-  const server = http2.createServer(async (req, res) => {
-    res.setHeader("Content-Type", "application/json");
-    try {
-      if (req.method === "GET" && req.url === "/health") {
-        res.end(JSON.stringify({ version: VERSION, pid: process.pid, concurrency: config2.concurrency }));
-        return;
-      }
-      if (req.method !== "POST" || req.url !== "/rpc") throw new Error("Unknown endpoint.");
+// src/control.mjs
+var [command = "help", flag, file2] = process.argv.slice(2);
+var commands = ["doctor", "models", "spawn", "status", "list", "wait", "followup", "cancel"];
+try {
+  if (command === "help" || command === "--help") {
+    console.log("Usage: node <plugin-root>/dist/control.mjs <" + commands.join("|") + "> [--json-file request.json | --stdin]\nJSON results on stdout. This is the plugin client, not the ZCode CLI.");
+  } else {
+    if (!commands.includes(command)) throw new Error("Unknown command: " + command);
+    let input2 = {};
+    if (flag === "--json-file" && file2) input2 = JSON.parse(await fs2.readFile(file2, "utf8"));
+    else if (flag === "--stdin" && !file2) {
       let body = "";
-      for await (const chunk of req) {
+      for await (const chunk of process.stdin) {
         body += chunk;
-        if (body.length > 1024 * 1024) throw new Error("Request too large.");
+        if (body.length > 1024 * 1024) throw new Error("Input too large");
       }
-      const { method, params } = JSON.parse(body);
-      const input2 = validate2(method, params);
-      let result;
-      switch (method) {
-        case "zcode_spawn":
-          result = await supervisor.spawn(input2);
-          break;
-        case "zcode_followup":
-          result = await supervisor.followup(input2);
-          break;
-        case "zcode_status":
-          result = await supervisor.status(input2.task_id);
-          break;
-        case "zcode_cancel":
-          result = await supervisor.cancel(input2.task_id);
-          break;
-        case "zcode_wait":
-          result = await supervisor.wait(input2);
-          break;
-        case "zcode_list": {
-          const all = await supervisor.list(input2.workflow_id);
-          result = { total: all.length, tasks: all.slice(-input2.limit).map((task) => ({
-            task_id: task.task_id,
-            workflow_id: task.workflow_id,
-            parent_task_id: task.parent_task_id,
-            status: task.status,
-            kind: task.kind,
-            created_at: task.created_at,
-            workspace: task.workspace
-          })) };
-          break;
-        }
-        case "zcode_doctor": {
-          let appServer;
-          try {
-            const runtime = await desktopRuntime(config2);
-            const host = await ensureHost(config2);
-            appServer = { available: true, runtime, ...host, ...await hostCall(config2, "models") };
-          } catch (error62) {
-            appServer = { available: false, error: error62.message };
-          }
-          result = {
-            version: VERSION,
-            concurrency: config2.concurrency,
-            hard_limit: 12,
-            backend: "desktop-app-server",
-            appServer,
-            data_directory: config2.home,
-            wait: { default_ms: 9e5, min_ms: 6e5, max_ms: 18e5, slice_ms: 2e4 }
-          };
-          break;
-        }
-        case "zcode_models":
-          await ensureHost(config2);
-          result = await hostCall(config2, "models");
-          break;
-      }
-      res.end(JSON.stringify({ result }));
-    } catch (error62) {
-      res.statusCode = 400;
-      res.end(JSON.stringify({ error: error62.message }));
-    }
-  });
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(config2.socket, resolve);
-  });
-  await fs5.chmod(config2.socket, 384);
-  let closing = false;
-  const close = async () => {
-    if (closing) return;
-    closing = true;
-    await supervisor.close();
-    server.close();
-    server.closeAllConnections();
-    await fs5.rm(config2.socket, { force: true });
-    await fs5.rm(lockPath, { recursive: true, force: true });
-  };
-  process.once("SIGTERM", () => {
-    close().finally(() => process.exit(0));
-  });
-  process.once("SIGINT", () => {
-    close().finally(() => process.exit(0));
-  });
-  return { server, supervisor, close };
+      input2 = JSON.parse(body);
+    } else if (flag) throw new Error("Use --json-file <path> or --stdin");
+    const method = "zcode_" + command;
+    console.log(JSON.stringify(await call(method, validate2(method, input2)), null, 2));
+  }
+} catch (error62) {
+  console.error(JSON.stringify({ error: error62.message }));
+  process.exitCode = 1;
 }
-if (process.argv[1] && path5.resolve(process.argv[1]) === fileURLToPath3(import.meta.url)) {
-  startDaemon().catch((error62) => {
-    console.error(error62.message);
-    process.exitCode = 1;
-  });
-}
-export {
-  startDaemon
-};

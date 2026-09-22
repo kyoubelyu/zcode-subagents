@@ -1,23 +1,27 @@
 {
   "name": "zcode-subagents",
-  "version": "0.1.0",
-  "description": "Let Codex orchestrate up to 12 persistent ZCode subagents.",
+  "version": "0.2.0",
+  "description": "Delegate up to 12 ZCode Desktop app-server sessions from Codex without MCP or prompt-mode CLI.",
   "type": "module",
   "private": true,
   "license": "MIT",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22.2"
+  },
   "scripts": {
     "build": "node scripts/build.mjs",
     "test": "node --test --test-concurrency=1 test/*.test.mjs",
     "check": "npm run build && npm test",
-    "start": "node dist/server.mjs"
+    "start": "node dist/control.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.30.0",
     "zod": "4.6.5"
   },
   "devDependencies": {
     "esbuild": "0.25.12"
   },
-  "repository": { "type": "git", "url": "https://github.com/kyoubelyu/zcode-subagents.git" }
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kyoubelyu/zcode-subagents.git"
+  }
 }
