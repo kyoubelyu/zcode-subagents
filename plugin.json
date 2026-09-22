@@ -1,0 +1,19 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "zcode-subagents",
+  "version": "0.1.0+codex.20260922024859",
+  "description": "Let Codex orchestrate up to 12 persistent ZCode subagents with resumable sessions and isolated edit worktrees.",
+  "author": {
+    "name": "kyoubelyu"
+  },
+  "repository": "https://github.com/kyoubelyu/zcode-subagents",
+  "homepage": "https://github.com/kyoubelyu/zcode-subagents",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "zcode",
+    "glm",
+    "astra",
+    "subagents"
+  ]
+}

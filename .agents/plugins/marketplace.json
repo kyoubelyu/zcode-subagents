@@ -1,0 +1,19 @@
+{
+  "name": "zcode-subagents-community",
+  "interface": { "displayName": "ZCode Subagents" },
+  "plugins": [
+    {
+      "name": "zcode-subagents",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/kyoubelyu/zcode-subagents.git",
+        "ref": "main"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "name": "zcode-subagents",
+  "version": "0.1.0+codex.20260922024859",
+  "description": "Let Codex orchestrate up to 12 persistent ZCode subagents with resumable sessions and isolated edit worktrees.",
+  "author": {
+    "name": "kyoubelyu"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "ZCode Subagents",
+    "shortDescription": "Astra plans. ZCode handles delegated tasks.",
+    "longDescription": "Bring ZCode into your Codex workflow with a shared pool of up to 12 workers, persistent task state, cancellation, session followups, and isolated Git worktrees.",
+    "developerName": "kyoubelyu",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": "Use ZCode subagents for independent parts of this task, then review their results.",
+    "websiteURL": "https://github.com/kyoubelyu/zcode-subagents"
+  },
+  "mcpServers": "./.mcp.json",
+  "license": "MIT",
+  "repository": "https://github.com/kyoubelyu/zcode-subagents"
+}
