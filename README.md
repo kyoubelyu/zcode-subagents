@@ -14,20 +14,20 @@ This plugin brings them together in my workflow. I stay in Codex, delegate throu
 
 ```text
 Codex / Astra
-  → plugin skill → short JSON command → persistent task supervisor (12 slots)
-                                      → shared desktop Host connection
-                                        → workspace app-server → selected model
+  → plugin MCP tools → persistent task supervisor (12 slots)
+                       → shared desktop Host connection
+                         → workspace app-server → selected model
   ← results, usage, progress, isolated Git worktrees
 ```
 
-Version **0.2 uses the existing desktop runtime directly**. It does not invoke `zcode -p`, require the ZCode CLI on PATH, or expose a Codex MCP server. Codex uses the bundled `dist/control.mjs` client through the plugin skill. Each command can exit without stopping its task.
+Version **0.2 uses the existing desktop runtime directly**, with the direct plugin tools from 0.1 restored. Codex calls `zcode_spawn`, `zcode_status`, and the other registered tools. The MCP adapter forwards requests to a detached supervisor; it does not own running tasks. It never invokes `zcode -p` or requires the ZCode CLI on PATH. A bundled command client is also available for diagnostics and recovery.
 
 The plugin starts a Host from the desktop's existing files when needed and reuses **its own** Host instance across clients and tasks. That official Host starts and reuses workspace app-servers and handles ZCode account authentication. The plugin does not attach to private stdio pipes belonging to the running desktop application.
 
 The plugin does **not** download, install, build, upgrade, patch, or vendor ZCode's runtime. It holds the connection needed to use it. It does not supervise runtime upgrades or automatically replay work after a crash. A later explicit request can start a fresh instance from the same files.
 
 - **At most 12 active tasks** across clients using the same data directory; extra tasks queue.
-- **Persistent task IDs and results.** Client exit and supervisor restart preserve work.
+- **Persistent task IDs and results.** MCP disconnection, client exit and supervisor restart preserve work.
 - **Linear followups** in the same session and workspace, with model inheritance or an explicit override.
 - **Isolated edits** in Git worktrees. The source repository must have a commit and be clean, including ordinary untracked files.
 - **Cancellation targets one session.** It does not kill the shared Host or another task.
@@ -48,7 +48,7 @@ These are external ZCode sessions, separate from Codex's native `spawn_agent` an
   ```
 
 - A usable model/account configuration in ZCode. Existing authentication is reused by the official Host. If it expires, resolve it in ZCode Desktop.
-- Codex with plugin skills and local command execution.
+- Codex with plugin skills and stdio MCP support.
 
 The integration was tested against desktop Host **3.14.3**, its installed agent app-server **0.16.9**, and V4 wire protocol **3**. The desktop protocol can change; incompatible installations produce errors rather than triggering a runtime modification. Native Windows and macOS are not supported by this release.
 
@@ -59,7 +59,7 @@ codex plugin marketplace add kyoubelyu/zcode-subagents
 codex plugin add zcode-subagents@zcode-subagents-community
 ```
 
-Start a **new Codex thread** to load the updated skill. Built files are committed in `dist/`; plugin installation needs no npm build.
+Start a **new Codex thread** to load the updated skill and MCP tools. Built files are committed in `dist/`; plugin installation needs no npm build.
 
 Try:
 
@@ -69,11 +69,34 @@ Try:
 
 ### Upgrading from 0.1
 
-Finish or cancel old tasks, then run `node scripts/control.mjs stop` from the old source checkout if its supervisor is still running. Update/reinstall the plugin and open a new Codex thread. The new plugin has no MCP registration, so an old thread's closed MCP connection is not a way to invoke it.
+Finish or cancel old 0.1 tasks, then run `node scripts/control.mjs stop` from the old source checkout if its supervisor is still running. Update/reinstall the plugin and open a new Codex thread. All seven original tools are available, plus `zcode_models`. Existing 0.2 app-server tasks share the same supervisor and Host with the restored MCP adapter.
 
 Existing task artifacts and worktrees are retained. New tasks use the desktop backend. Followups to historical CLI sessions depend on whether the installed desktop app-server can resume that history; completed old results remain readable. `ZCODE_SUBAGENTS_BIN` is no longer used.
 
-## Command interface
+## Direct plugin tools
+
+Use these tools directly from Codex; shell commands are not required for normal delegation.
+
+| Tool | Purpose |
+| --- | --- |
+| `zcode_spawn` | Queue a new task and return its ID |
+| `zcode_status` | Read a task's progress, response, usage and artifacts |
+| `zcode_list` | Find tasks, optionally by `workflow_id` |
+| `zcode_wait` | Wait for any/all tasks, preserving a logical deadline |
+| `zcode_followup` | Continue the same session; return a new task ID |
+| `zcode_cancel` | Stop one task and retain its artifacts |
+| `zcode_doctor` | Inspect runtime availability, pool and wait settings |
+| `zcode_models` | Read the default and available model selections |
+
+The adapter keeps protocol traffic on stdout and returns tool errors without
+terminating the connection. A disconnected MCP client does not cancel or replay
+tasks. Reconnect and use their task IDs or workflow/request keys to recover them.
+If Codex reports `transport closed`, it still needs to reconnect its tool client
+(a new thread loads the installed registration); a server cannot repair the
+client's dead transport from inside it. The command client below can inspect
+existing work during recovery.
+
+## Command client for diagnostics
 
 Resolve `<plugin-root>` from the installed skill's location, then invoke:
 
@@ -83,20 +106,9 @@ node <plugin-root>/dist/control.mjs models
 node <plugin-root>/dist/control.mjs spawn --json-file request.json
 ```
 
-`doctor` checks runtime availability and settings; `models` reads the current default and available provider/model IDs. They may start the installed Host, but do not send a model prompt. All commands return JSON. Supply payloads using `--json-file` or `--stdin`, preserving prompt text literally.
+Command names are the tool names without `zcode_`, with the same JSON payloads and shared task pool. `doctor` and `models` may start the installed Host, but do not send a model prompt. All commands return JSON. Supply payloads using `--json-file` or `--stdin`, preserving prompt text literally.
 
-| Command | Purpose |
-| --- | --- |
-| `spawn` | Queue a new task and return its ID |
-| `status` | Read a task's progress, response, usage and artifacts |
-| `list` | Find tasks, optionally by `workflow_id` |
-| `wait` | Wait for any/all tasks, preserving a logical deadline |
-| `followup` | Continue the same session; return a new task ID |
-| `cancel` | Stop one task and retain its artifacts |
-| `doctor` | Inspect runtime availability, pool and wait settings |
-| `models` | Read the default and available model selections |
-
-Example `request.json`:
+Example `zcode_spawn` arguments (also accepted as command-client `request.json`):
 
 ```json
 {
@@ -141,7 +153,7 @@ For a followup, pass `task_id`, a new `request_key`, and `prompt`; optionally pa
 
 ## Waiting, failures and review
 
-Waits default to **15 minutes**, accept **10–30 minutes**, and return after at most **20 seconds per command**. Repeat `wait` with its returned `wait_id` to retain the original deadline. A wait timeout leaves the task running. `run_timeout_ms` is a separate execution deadline; `0` leaves it unset.
+Waits default to **15 minutes**, accept **10–30 minutes**, and return after at most **20 seconds per tool call**. Repeat `zcode_wait` with its returned `wait_id` to retain the original deadline. A wait timeout leaves the task running. `run_timeout_ms` is a separate execution deadline; `0` leaves it unset.
 
 The plugin uses V4 commands and authoritative conversation snapshots. `succeeded` means it observed the submitted turn finish successfully with an assistant response. It does not mean the generated code is correct or its suggested tests ran. Usage is the session's cumulative usage, including earlier followup turns.
 
@@ -153,7 +165,7 @@ Analysis tasks enable ZCode's plan state and allow reading/search tools. Edit ta
 
 ## Configuration and local data
 
-Set these in the environment used to invoke the plugin client:
+Set these in the environment used to launch the MCP adapter or command client:
 
 | Variable | Default |
 | --- | --- |
@@ -161,7 +173,7 @@ Set these in the environment used to invoke the plugin client:
 | `ZCODE_SUBAGENTS_CONCURRENCY` | `12`; accepts 1–12 |
 | `ZCODE_SUBAGENTS_HOME` | `~/.local/share/zcode-subagents` |
 
-Clients sharing the data directory share the supervisor and Host. Do not use extra directories to bypass the pool limit. Finish tasks and stop the supervisor before changing its settings. A different runtime root requires explicitly stopping the plugin-owned Host after its tasks finish; the client never takes over an incompatible live instance.
+Clients sharing the data directory share the supervisor and Host. If Codex removes an old plugin cache during reinstall, the new client replaces the stale plugin supervisor while preserving active workers and the Host. Do not use extra directories to bypass the pool limit. Finish tasks and stop the supervisor before changing its settings. A different runtime root requires explicitly stopping the plugin-owned Host after its tasks finish; the client never takes over an incompatible live instance.
 
 Task prompts, state, progress, results and worktrees are retained in private directories. Adapter logs remain local. They can contain source code or other task data; do not publish them. The plugin does not read or copy account credentials into task requests or results.
 
@@ -174,7 +186,7 @@ npm ci
 npm run check
 ```
 
-Tests use a fake desktop Host and temporary repositories, with no model credentials. They cover the 12-task cap, queue, deduplication, default/explicit models, followup inheritance, isolated edits, cancellation, wait deadlines, client exit, supervisor restart, worker/Host crashes, and binary/snapshot framing.
+Tests use a fake desktop Host and temporary repositories, with no model credentials. They cover all eight MCP tools, task recovery after an MCP disconnect, tool-error isolation, the 12-task cap, queue, deduplication, default/explicit models, followup inheritance, isolated edits, cancellation, wait deadlines, client exit, supervisor restart, worker/Host crashes, and binary/snapshot framing.
 
 A separate live test consumes provider quota:
 
@@ -182,6 +194,6 @@ A separate live test consumes provider quota:
 node scripts/smoke.mjs
 ```
 
-It checks the default model, an explicit override, a real edit and Python tests, followup inheritance, reset to `default`, Host reuse, and unchanged runtime-file hashes/default selection. Set `ZCODE_SUBAGENTS_SMOKE_MODEL` to a JSON model object to choose its explicit override. Its temporary fixture and task artifacts are retained for inspection.
+It calls the MCP tools to check the default model, an explicit override, a real edit and Python tests, followup inheritance, reset to `default`, Host reuse, and unchanged runtime-file hashes/default selection. Set `ZCODE_SUBAGENTS_SMOKE_MODEL` to a JSON model object to choose its explicit override. Set `ZCODE_SUBAGENTS_SMOKE_SERVER` to test an installed `dist/server.mjs`. Its temporary fixture and task artifacts are retained for inspection.
 
 Commit rebuilt `dist/` with source changes. GitHub Actions checks tests and bundle consistency. Protocol implementation notes are in [docs/app-server.md](docs/app-server.md). The plugin is MIT licensed; bundled dependency notices are in [dist/THIRD-PARTY-NOTICES.txt](dist/THIRD-PARTY-NOTICES.txt).

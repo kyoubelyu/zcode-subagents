@@ -6,8 +6,10 @@ and owns account authentication, model resolution and session execution. The
 plugin never downloads, builds, upgrades, patches or vendors those executables.
 An optional runtime root selects another existing installation.
 
-Codex invokes a short-lived command through the plugin skill. There is no Codex
-MCP connection and no prompt-mode ZCode CLI execution. A detached task supervisor
+Codex invokes the registered MCP tools through a disposable stdio adapter. The
+skill prefers direct tools; the short-lived command remains available for
+diagnostics and explicit recovery. There is no prompt-mode ZCode CLI execution.
+The MCP adapter forwards requests and owns no task or app-server lifecycle. A detached task supervisor
 retains the existing shared 12-task cap, queue, idempotency and worktree behavior.
 A separate local connection adapter launches the desktop Host on demand, retains
 its stdio connection and exposes a private Unix socket. New clients reuse it;
@@ -31,7 +33,7 @@ the tested desktop/agent pair rejects its own newer event payload fields there.
 The submitted command's turn header and assistant text determine completion;
 long turns page older rows up to a 10,000-row limit. A lost submission reply is reported as
 uncertain rather than replayed. Polls use bounded reads and reconnect independently
-of the command client. Cancellation targets only the task's session, never the
+of the MCP or command client. Cancellation targets only the task's session, never the
 shared Host. A crashed worker requires the supervisor to stop that session before
 releasing its concurrency slot. Existing v0.1 tasks retain their artifacts.
 
@@ -48,3 +50,18 @@ reuse a Host; edit worktrees remain isolated; 12 jobs run and the 13th queues;
 cancellation affects only its session; client disconnect and supervisor restart
 preserve work; Host failure does not duplicate submissions. README and skill
 instructions describe only the delivered app-server integration.
+
+Direct-tool acceptance: all original seven zcode_* tools plus zcode_models are
+discoverable from the installed manifest. Model defaults/overrides use the same
+schemas as the command client. Tool/backend errors leave the MCP connection
+usable; disconnect during a wait preserves the task, and a new client retrieves
+the original result without creating another task. Followups and cancellation
+through MCP preserve shared Host identity. No reconnect automatically resubmits
+work. A closed Codex-owned MCP transport still requires client reconnection; it
+cannot be repaired from inside that dead transport.
+
+Codex may delete the previous plugin cache on reinstall. A current client detects
+the same-version supervisor's missing entry/worker files and replaces only that
+owned supervisor after verifying its process identity. Workers and the Host
+survive; queued work is not dispatched from a deleted cache. This updates plugin
+processes only, never the installed desktop runtime.

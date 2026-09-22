@@ -26,7 +26,8 @@ export async function startDaemon(config = settings()) {
     res.setHeader('Content-Type', 'application/json');
     try {
       if (req.method === 'GET' && req.url === '/health') {
-        res.end(JSON.stringify({ version: VERSION, pid: process.pid, concurrency: config.concurrency }));
+        res.end(JSON.stringify({ version: VERSION, pid: process.pid, concurrency: config.concurrency,
+          entry: fileURLToPath(import.meta.url) }));
         return;
       }
       if (req.method !== 'POST' || req.url !== '/rpc') throw new Error('Unknown endpoint.');

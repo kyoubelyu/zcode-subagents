@@ -183,6 +183,9 @@ export class Supervisor {
           continue;
         }
         if (count >= this.config.concurrency) continue;
+        // A Codex reinstall can remove this supervisor's old plugin cache.
+        // Leave queued work queued until a current client replaces the supervisor.
+        try { await fs.access(workerPath); } catch (error) { if (error.code === 'ENOENT') break; throw error; }
         if (task.spec.parentTaskId) {
           const parent = await this.task(task.spec.parentTaskId);
           if (!TERMINAL.has(parent.state.status)) continue;

@@ -7,15 +7,19 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
 const execute = promisify(execFile);
 const root = fileURLToPath(new URL('../', import.meta.url));
-const client = process.env.ZCODE_SUBAGENTS_SMOKE_CLIENT || path.join(root, 'dist/control.mjs');
+const server = process.env.ZCODE_SUBAGENTS_SMOKE_SERVER || path.join(root, 'dist/server.mjs');
+const client = new Client({ name: 'zcode-live-smoke', version: '0.2.0' });
+await client.connect(new StdioClientTransport({ command: process.execPath, args: [server], stderr: 'inherit' }));
 const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-live-'));
-const requestFile = path.join(cwd, 'request.json');
 const command = async (name, input = {}) => {
-  await fs.writeFile(requestFile, JSON.stringify(input), { mode: 0o600 });
-  return JSON.parse((await execute(process.execPath, [client, name, '--json-file', requestFile], { maxBuffer: 4 * 1024 * 1024 })).stdout);
+  const result = await client.callTool({ name: 'zcode_' + name, arguments: input });
+  if (result.isError) throw new Error(result.content[0].text);
+  return result.structuredContent || JSON.parse(result.content[0].text);
 };
 const terminal = new Set(['succeeded', 'failed', 'cancelled', 'interrupted']);
 const tasks = [];
@@ -84,9 +88,10 @@ try {
   assert.deepEqual(await hashRuntime(doctor.appServer.runtime), before);
   console.log('LIVE_SMOKE_PASSED', JSON.stringify({ tasks, workspace: edited.workspace, desktop: doctor.appServer.desktopVersion, defaultModel, explicit }));
 } finally {
-  for (const id of tasks) {
-    const state = await command('status', { task_id: id }).catch(() => undefined);
-    if (state && !terminal.has(state.status)) await command('cancel', { task_id: id });
-  }
-  await fs.rm(requestFile, { force: true });
+  try {
+    for (const id of tasks) {
+      const state = await command('status', { task_id: id }).catch(() => undefined);
+      if (state && !terminal.has(state.status)) await command('cancel', { task_id: id });
+    }
+  } finally { await client.close(); }
 }

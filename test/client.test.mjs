@@ -60,3 +60,35 @@ test('missing desktop runtime reports actionable error without installing anythi
   assert.match(doctor.appServer.error, /never downloads or modifies/);
   await assert.rejects(fs.access(config.runtimeRoot));
 });
+
+test('a removed plugin cache replaces only the supervisor and preserves active tasks and Host', async (t) => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'zsa-cache-'));
+  const env = { ...process.env, ZCODE_SUBAGENTS_HOME: home, ZCODE_SUBAGENTS_RUNTIME_ROOT: await fixtureRuntime(home) };
+  const config = settings(env);
+  const oldRoot = path.join(home, 'old-cache'); await fs.mkdir(oldRoot);
+  const dist = fileURLToPath(new URL('../dist/', import.meta.url));
+  for (const name of ['control.mjs', 'daemon.mjs', 'worker.mjs', 'host.mjs']) await fs.copyFile(path.join(dist, name), path.join(oldRoot, name));
+  let serial = 0;
+  const run = async (entry, command, input = {}) => {
+    const file = path.join(home, 'request-' + (++serial) + '.json'); await fs.writeFile(file, JSON.stringify(input));
+    return JSON.parse((await execute(process.execPath, [entry, command, '--json-file', file], { env })).stdout);
+  };
+  t.after(async () => {
+    const owner = await readJson(path.join(home, 'supervisor.lock/owner.json'));
+    if (await sameProcess(owner)) process.kill(owner.pid, 'SIGTERM');
+    await stopHost(config); await delay(500); await fs.rm(home, { recursive: true, force: true });
+  });
+  const oldClient = path.join(oldRoot, 'control.mjs');
+  const first = await run(oldClient, 'spawn', { workflow_id: 'cache-test', request_key: 'running', cwd: home, prompt: '[fixture:sleep=2500]' });
+  let state;
+  for (let i = 0; i < 80; i++) { state = await run(oldClient, 'status', { task_id: first.task_id }); if (state.status === 'running') break; await delay(100); }
+  assert.equal(state.status, 'running');
+  const before = await request(config, null, null, true), host = await hostHealth(config);
+  await fs.rm(oldRoot, { recursive: true });
+  const doctor = await run(client, 'doctor');
+  assert.equal(doctor.appServer.instance, host.instance);
+  assert.notEqual((await request(config, null, null, true)).pid, before.pid);
+  const second = await run(client, 'spawn', { workflow_id: 'cache-test', request_key: 'new', cwd: home, prompt: 'continue' });
+  const result = await run(client, 'wait', { task_ids: [first.task_id, second.task_id] });
+  assert.ok(result.tasks.every((task) => task.status === 'succeeded'), JSON.stringify(result));
+});

@@ -1,7 +1,7 @@
 {
   "name": "zcode-subagents",
   "version": "0.2.0",
-  "description": "Delegate up to 12 ZCode Desktop app-server sessions from Codex without MCP or prompt-mode CLI.",
+  "description": "Delegate up to 12 ZCode Desktop app-server sessions through direct Codex plugin tools.",
   "type": "module",
   "private": true,
   "license": "MIT",
@@ -12,9 +12,10 @@
     "build": "node scripts/build.mjs",
     "test": "node --test --test-concurrency=1 test/*.test.mjs",
     "check": "npm run build && npm test",
-    "start": "node dist/control.mjs"
+    "start": "node dist/server.mjs"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
     "zod": "4.6.5"
   },
   "devDependencies": {

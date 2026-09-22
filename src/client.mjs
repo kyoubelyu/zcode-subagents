@@ -1,9 +1,21 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { openSync, closeSync } from 'node:fs';
+import { openSync, closeSync, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { settings, privateDir, delay, VERSION } from './common.mjs';
+import { settings, privateDir, delay, VERSION, readJson, sameProcess } from './common.mjs';
+
+async function supervisorFilesExist(health) {
+  let entry = health.entry;
+  if (!entry) {
+    // Older 0.2 supervisors did not advertise their entry path.
+    try { entry = (await fs.readFile('/proc/' + health.pid + '/cmdline', 'utf8')).split('\0')[1]; }
+    catch { return false; }
+  }
+  if (!entry || path.basename(entry) !== 'daemon.mjs') throw new Error('Cannot verify the existing supervisor entry path.');
+  try { await fs.access(entry); await fs.access(path.join(path.dirname(entry), 'worker.mjs')); return true; }
+  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+}
 
 export function request(config, method, params, health = false) {
   return new Promise((resolve, reject) => {
@@ -38,7 +50,16 @@ export async function ensureDaemon(config = settings()) {
   if (health) {
     if (health.version !== VERSION) throw new Error('A different supervisor version is running. Finish tasks and stop it before upgrading.');
     if (health.concurrency !== config.concurrency) throw new Error('The shared supervisor has a different concurrency setting. Finish tasks and stop it before reconfiguring.');
-    return config;
+    if (await supervisorFilesExist(health)) return config;
+    const entry = fileURLToPath(new URL('./daemon.mjs', import.meta.url));
+    try { await fs.access(entry); } catch { throw new Error('This plugin cache was removed. Reconnect using the updated installed plugin. Existing tasks are retained.'); }
+    const owner = await readJson(path.join(config.home, 'supervisor.lock/owner.json'));
+    if (owner?.pid !== health.pid) throw new Error('Supervisor changed during cache recovery; query again.');
+    // Only replace our stale task supervisor. Detached workers and the shared
+    // desktop Host remain alive; the new supervisor rediscovers their state.
+    if (await sameProcess(owner)) { try { process.kill(owner.pid, 'SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') throw error; } }
+    for (let i = 0; i < 100 && await sameProcess(owner); i++) await delay(50);
+    if (await sameProcess(owner)) throw new Error('Old plugin supervisor is still stopping. Existing work is retained; query again shortly.');
   }
   await privateDir(config.home);
   const log = openSync(path.join(config.home, 'supervisor.log'), 'a', 0o600);

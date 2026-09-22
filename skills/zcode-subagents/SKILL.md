@@ -7,7 +7,21 @@ Keep planning, ambiguous decisions, integration and final verification in Codex.
 Give ZCode concrete tasks and acceptance criteria. Workers do not inherit the
 Codex conversation. Review their evidence before relying on it.
 
-## Invoke the bundled client
+## Use the plugin tools directly
+
+Prefer the registered zcode_spawn, zcode_status, zcode_wait, zcode_followup,
+zcode_cancel, zcode_list, zcode_doctor and zcode_models tools. They forward requests
+to the shared desktop app-server task pool. Do not substitute shell commands for
+available plugin tools. These are external ZCode sessions, not native spawn_agent
+or wait_agent sessions.
+
+The MCP connection owns no task lifecycle. Disconnecting it does not cancel or
+replay tasks. After reconnecting, query existing task IDs; retry a lost spawn reply
+only with the identical workflow_id/request_key and payload. Backend/validation
+errors are tool errors, not a reason to restart the Host. A closed Codex-owned
+transport requires reconnection or a new thread to load the installed tools.
+
+## Command fallback for diagnostics and recovery
 
 Resolve the plugin root as two directories above this SKILL.md's directory.
 Use the exact installed path; do not assume a particular version/cache path.
@@ -18,12 +32,14 @@ node <plugin-root>/dist/control.mjs models
 node <plugin-root>/dist/control.mjs <spawn|status|list|wait|followup|cancel> --json-file <request.json>
 ```
 
-These are short JSON commands, not MCP tools or the ZCode CLI. Do not call old
-zcode_spawn MCP tools, `zcode -p`, or native spawn_agent for this backend. Use a
+Use this fallback to diagnose missing/unavailable tools or recover existing
+tasks. Explain when the direct MCP tools are unavailable. The command client
+uses the same pool and request schemas, so do not submit duplicate work under a
+new key. It is not the ZCode CLI; never use `zcode -p` for this backend. Use a
 private JSON file (or literal JSON via --stdin) to avoid interpreting prompt text
 as shell code. Do not interpolate arbitrary prompts into a shell command.
 
-`doctor` reports desktop availability, pool settings and default model. `models`
+zcode_doctor reports desktop availability, pool settings and default model. zcode_models
 lists providerId/modelId and reasoningLevels. Both can start the existing desktop
 Host without calling a model. The plugin only starts/reuses its own Host using
 existing desktop files. Never install, upgrade, patch or rebuild ZCode to repair
@@ -32,7 +48,7 @@ ZCode; do not copy tokens or modify account files.
 
 ## Requests and model routing
 
-Spawn payload:
+zcode_spawn payload:
 
 ```json
 {
@@ -61,7 +77,7 @@ is omitted, the resolver chooses the last advertised level. Specify it when the
 user cares about reasoning cost or latency. Per-input overrides do not change the
 configured default. Check effectiveModel and observedModel in the result.
 
-Followup payload: `task_id`, a new `request_key`, `prompt`, optional `model` and
+zcode_followup payload: `task_id`, a new `request_key`, `prompt`, optional `model` and
 `run_timeout_ms`. Omitted model inherits the parent's effective model; `"default"`
 resolves the current default again. It queues behind a busy parent and resumes
 the same session/workspace. Continue from its returned task ID; sibling followups
@@ -79,9 +95,9 @@ are rejected. Followups do not steer an active turn.
 - Bash, recursive agents, workflows and third-party MCP tools are outside the
   task allowlist. Ask workers to write tests and return commands. Review files,
   then run checks from Codex. Do not promise worker shell execution.
-- Spawn returns a task_id immediately. Continue independent local work.
-  status/cancel take `{"task_id":"<id>"}`. list accepts optional workflow_id.
-- Start a wait with `{"task_ids":["<id>"],"mode":"all"}` (or mode any).
+- zcode_spawn returns a task_id immediately. Continue independent local work.
+  zcode_status/zcode_cancel take `{"task_id":"<id>"}`. zcode_list accepts optional workflow_id.
+- Call zcode_wait with `{"task_ids":["<id>"],"mode":"all"}` (or mode any).
   Each call returns after at most 20 seconds. Repeat with
   `{"wait_id":"<returned id>"}` until ready or timed_out. The logical timeout
   defaults to 15 minutes and accepts timeout_ms from 600000 to 1800000. A wait
@@ -91,7 +107,7 @@ are rejected. Followups do not steer an active turn.
   Read the response, inspect changes.patch and untrackedFiles in the retained
   worktree, and run meaningful checks. Usage is session cumulative, including
   earlier turns. No automatic merge or publication occurs.
-- Client exits and supervisor restarts preserve work. Use status/list to
+- MCP/client exits and supervisor restarts preserve work. Use zcode_status/zcode_list to
   reconnect. Runtime crashes are reported without replay. Review failed or
   interrupted artifacts before explicitly retrying. cleanup_pending retains
   its concurrency slot until the session is confirmed stopped.

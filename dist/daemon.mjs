@@ -416,6 +416,12 @@ var Supervisor = class {
           continue;
         }
         if (count >= this.config.concurrency) continue;
+        try {
+          await fs3.access(workerPath);
+        } catch (error62) {
+          if (error62.code === "ENOENT") break;
+          throw error62;
+        }
         if (task.spec.parentTaskId) {
           const parent = await this.task(task.spec.parentTaskId);
           if (!TERMINAL.has(parent.state.status)) continue;
@@ -20259,7 +20265,12 @@ async function startDaemon(config2 = settings()) {
     res.setHeader("Content-Type", "application/json");
     try {
       if (req.method === "GET" && req.url === "/health") {
-        res.end(JSON.stringify({ version: VERSION, pid: process.pid, concurrency: config2.concurrency }));
+        res.end(JSON.stringify({
+          version: VERSION,
+          pid: process.pid,
+          concurrency: config2.concurrency,
+          entry: fileURLToPath3(import.meta.url)
+        }));
         return;
       }
       if (req.method !== "POST" || req.url !== "/rpc") throw new Error("Unknown endpoint.");

@@ -6,12 +6,12 @@ var __export = (target, all) => {
 };
 
 // src/control.mjs
-import { promises as fs2 } from "node:fs";
+import { promises as fs3 } from "node:fs";
 
 // src/client.mjs
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { openSync, closeSync } from "node:fs";
+import { openSync, closeSync, promises as fs2 } from "node:fs";
 import path2 from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -42,8 +42,49 @@ async function privateDir(dir) {
   await fs.mkdir(dir, { recursive: true, mode: 448 });
   await fs.chmod(dir, 448);
 }
+async function readJson(file3, fallback = void 0) {
+  try {
+    return JSON.parse(await fs.readFile(file3, "utf8"));
+  } catch (error62) {
+    if (error62.code === "ENOENT") return fallback;
+    throw error62;
+  }
+}
+async function processIdentity(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 2) return void 0;
+  try {
+    const raw = await fs.readFile("/proc/" + pid + "/stat", "utf8");
+    const fields = raw.slice(raw.lastIndexOf(")") + 2).split(" ");
+    if (fields[0] === "Z") return void 0;
+    return fields[19];
+  } catch {
+    return void 0;
+  }
+}
+async function sameProcess(owner) {
+  return Boolean(owner?.pid && owner?.identity && await processIdentity(owner.pid) === owner.identity);
+}
 
 // src/client.mjs
+async function supervisorFilesExist(health) {
+  let entry = health.entry;
+  if (!entry) {
+    try {
+      entry = (await fs2.readFile("/proc/" + health.pid + "/cmdline", "utf8")).split("\0")[1];
+    } catch {
+      return false;
+    }
+  }
+  if (!entry || path2.basename(entry) !== "daemon.mjs") throw new Error("Cannot verify the existing supervisor entry path.");
+  try {
+    await fs2.access(entry);
+    await fs2.access(path2.join(path2.dirname(entry), "worker.mjs"));
+    return true;
+  } catch (error62) {
+    if (error62.code === "ENOENT") return false;
+    throw error62;
+  }
+}
 function request(config2, method, params, health = false) {
   return new Promise((resolve, reject) => {
     const req = http.request({
@@ -84,7 +125,24 @@ async function ensureDaemon(config2 = settings()) {
   if (health) {
     if (health.version !== VERSION) throw new Error("A different supervisor version is running. Finish tasks and stop it before upgrading.");
     if (health.concurrency !== config2.concurrency) throw new Error("The shared supervisor has a different concurrency setting. Finish tasks and stop it before reconfiguring.");
-    return config2;
+    if (await supervisorFilesExist(health)) return config2;
+    const entry = fileURLToPath(new URL("./daemon.mjs", import.meta.url));
+    try {
+      await fs2.access(entry);
+    } catch {
+      throw new Error("This plugin cache was removed. Reconnect using the updated installed plugin. Existing tasks are retained.");
+    }
+    const owner = await readJson(path2.join(config2.home, "supervisor.lock/owner.json"));
+    if (owner?.pid !== health.pid) throw new Error("Supervisor changed during cache recovery; query again.");
+    if (await sameProcess(owner)) {
+      try {
+        process.kill(owner.pid, "SIGTERM");
+      } catch (error62) {
+        if (error62.code !== "ESRCH") throw error62;
+      }
+    }
+    for (let i = 0; i < 100 && await sameProcess(owner); i++) await delay(50);
+    if (await sameProcess(owner)) throw new Error("Old plugin supervisor is still stopping. Existing work is retained; query again shortly.");
   }
   await privateDir(config2.home);
   const log = openSync(path2.join(config2.home, "supervisor.log"), "a", 384);
@@ -19856,7 +19914,7 @@ try {
   } else {
     if (!commands.includes(command)) throw new Error("Unknown command: " + command);
     let input2 = {};
-    if (flag === "--json-file" && file2) input2 = JSON.parse(await fs2.readFile(file2, "utf8"));
+    if (flag === "--json-file" && file2) input2 = JSON.parse(await fs3.readFile(file2, "utf8"));
     else if (flag === "--stdin" && !file2) {
       let body = "";
       for await (const chunk of process.stdin) {
