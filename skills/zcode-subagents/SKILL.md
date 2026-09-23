@@ -114,6 +114,13 @@ are rejected. Followups do not steer an active turn.
 - Cancel obsolete tasks and confirm a terminal state before treating the slot
   as free. Cancellation stops only that session, never the shared Host or the
   desktop application's processes. Do not kill unrelated ZCode processes.
+- Once all tasks in a workspace stop, the supervisor releases its app-server
+  process using ZCode's official API. The shared Host, durable conversation,
+  result files and worktree are retained. Followups start a fresh process and
+  resume the same session. resourceCleanup.status is released after cleanup,
+  or pending with an error while it retries. A terminal task sharing a workspace
+  with active tasks waits for them. History entries are not deleted. Do not
+  manually kill processes to clean up completed tasks.
 
 Keep task artifacts private. They can contain source code and user data; do not
 publish them with the plugin or paste entire diagnostic logs into chat. Runtime

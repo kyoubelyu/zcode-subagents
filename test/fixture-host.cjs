@@ -5,6 +5,13 @@
   const path = await import('node:path');
   const crypto = await import('node:crypto');
   const sessions = new Map();
+  const runtimes = new Map();
+  let generation = 0;
+  const ensureRuntime = (workspace) => {
+    if (!runtimes.has(workspace)) runtimes.set(workspace, {
+      identity: crypto.randomUUID(), generation: ++generation, processId: process.pid,
+    });
+  };
   const listeners = new Map();
   const defaultModel = { providerId: 'fixture', modelId: 'default', options: { reasoningLevel: 'high' } };
   const models = ['default', 'explicit'];
@@ -40,15 +47,27 @@
     }
     if (name === 'helloConversationV4') return { protocolVersion: 3 };
     if (name === 'initializeConversationV4') return;
-    if (name === 'getWorkspaceRuntimeIdentity') return { identity: p.workspacePath, generation: 1, processId: process.pid };
+    if (name === 'getWorkspaceRuntimeIdentity') {
+      if (!runtimes.has(p.workspacePath)) throw new Error('ZCode agent runtime identity is unavailable.');
+      return runtimes.get(p.workspacePath);
+    }
+    if (name === 'disposeWorkspace') {
+      for (const s of sessions.values()) if (s.target.workspacePath === p.workspacePath && s.status === 'running') {
+        throw new Error('Cannot dispose a workspace with an active session');
+      }
+      runtimes.delete(p.workspacePath); return;
+    }
     if (name === 'unsubscribeConversationV4') return;
     if (name === 'createSession') {
+      ensureRuntime(p.workspacePath);
       const s = { id: 'sess_' + crypto.randomUUID(), model: defaultModel, status: 'idle', events: [], target: p };
       sessions.set(s.id, s); return snapshot(s);
     }
     const s = sessions.get(p.sessionId || p.envelope?.sessionId);
     if (!s) throw new Error('Session unavailable');
-    if (name === 'resumeSession' || name === 'readSession') return snapshot(s);
+    if (name === 'resumeSession') { ensureRuntime(p.workspacePath); return snapshot(s); }
+    if (!runtimes.has(p.workspacePath)) throw new Error('Workspace runtime unavailable');
+    if (name === 'readSession') return snapshot(s);
     if (name === 'readSessionEvents') return s.events.filter((e) => e.seq > (p.afterSeq || 0));
     if (name === 'subscribeConversationV4') {
       const subscriptionId = crypto.randomUUID(), topic = 'conversation/' + s.id;
@@ -66,6 +85,10 @@
       const text = e.payload.text;
       if (text.includes('[fixture:args]')) await fs.writeFile(path.join(p.workspacePath, 'arguments.json'), JSON.stringify({ create: s.target, envelope: e }));
       if (text.includes('[fixture:crash]')) { setTimeout(() => process.exit(7), 100); return { status: 'accepted' }; }
+      if (text.includes('[fixture:runtime-exit]')) {
+        setTimeout(() => { s.status = 'error'; runtimes.delete(p.workspacePath); }, 100);
+        return { status: 'accepted' };
+      }
       if (text.includes('[fixture:fail]')) {
         s.events.push({ type: 'turn.failed', seq: 1, payload: { inputId: e.commandId, error: { message: 'Fixture turn failed' } } });
         s.status = 'error'; return { status: 'accepted' };

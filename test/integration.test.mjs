@@ -8,7 +8,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { Supervisor } from '../src/supervisor.mjs';
 import { settings, TERMINAL, delay, processIdentity, atomicJson } from '../src/common.mjs';
-import { fixtureRuntime, stopHost } from './helpers.mjs';
+import { fixtureRuntime, stopHost, legacyHost } from './helpers.mjs';
 import { hostHealth, hostCall } from '../src/host-client.mjs';
 import { Frames, frame } from '../src/host-wire.mjs';
 import { validate } from '../src/schemas.mjs';
@@ -45,6 +45,98 @@ const input = (ctx, key, prompt = 'test', kind = 'analysis') => validate('zcode_
 const done = (ctx, id) => until(async () => {
   const result = await ctx.manager.status(id);
   return TERMINAL.has(result.status) && result;
+});
+const released = (ctx, id) => until(async () => {
+  const result = await ctx.manager.status(id);
+  return result.resourceCleanup?.status === 'released' && result;
+});
+
+test('idle workspace runtimes are released; cold followups retain session, files, model and Host', async (t) => {
+  const ctx = await setup(t);
+  const a = await ctx.manager.spawn({ ...input(ctx, 'cold-parent'),
+    model: { providerId: 'fixture', modelId: 'explicit', options: { reasoningLevel: 'low' } } });
+  const first = await released(ctx, a.task_id);
+  assert.equal(first.status, 'succeeded');
+  assert.equal(first.resourceCleanup.historyRetained, true);
+  await assert.rejects(hostCall(ctx.config, 'identity', { workspacePath: ctx.workspace }), /runtime identity is unavailable/);
+  await fs.writeFile(path.join(ctx.workspace, 'keep.txt'), 'retained');
+  const b = await ctx.manager.followup(validate('zcode_followup', {
+    task_id: a.task_id, request_key: 'cold-followup', prompt: 'continue',
+  }));
+  const second = await released(ctx, b.task_id);
+  assert.equal(second.status, 'succeeded');
+  assert.equal(second.sessionId, first.sessionId);
+  assert.equal(second.workspace, first.workspace);
+  assert.deepEqual(second.effectiveModel, first.effectiveModel);
+  assert.notEqual(second.runtimeIdentity.identity, first.runtimeIdentity.identity);
+  assert.equal((await hostHealth(ctx.config)).hostPid, first.appServer.hostPid);
+  assert.equal(await fs.readFile(path.join(ctx.workspace, 'keep.txt'), 'utf8'), 'retained');
+  await assert.rejects(hostCall(ctx.config, 'identity', { workspacePath: ctx.workspace }), /runtime identity is unavailable/);
+});
+
+test('release waits for every task in a workspace and leaves other workspaces running', async (t) => {
+  const ctx = await setup(t);
+  const otherWorkspace = path.join(ctx.home, 'other');
+  await fs.mkdir(otherWorkspace);
+  const a = await ctx.manager.spawn(input(ctx, 'short'));
+  const b = await ctx.manager.spawn(input(ctx, 'long', '[fixture:sleep=5000]'));
+  const c = await ctx.manager.spawn({ ...input(ctx, 'other-long', '[fixture:sleep=30000]'), cwd: otherWorkspace });
+  const first = await done(ctx, a.task_id);
+  assert.equal(first.status, 'succeeded');
+  await delay(500);
+  assert.equal((await ctx.manager.status(a.task_id)).resourceCleanup, undefined);
+  assert.equal((await hostCall(ctx.config, 'identity', { workspacePath: ctx.workspace })).identity, first.runtimeIdentity.identity);
+  await released(ctx, b.task_id);
+  await released(ctx, a.task_id);
+  assert.equal((await ctx.manager.status(c.task_id)).status, 'running');
+  assert.ok(await hostCall(ctx.config, 'identity', { workspacePath: otherWorkspace }));
+  await ctx.manager.cancel(c.task_id);
+  assert.equal((await released(ctx, c.task_id)).status, 'cancelled');
+  await assert.rejects(hostCall(ctx.config, 'identity', { workspacePath: otherWorkspace }), /runtime identity is unavailable/);
+});
+
+test('a mismatched runtime identity cannot dispose a replacement process', async (t) => {
+  const ctx = await setup(t);
+  const a = await ctx.manager.spawn(input(ctx, 'identity-guard', '[fixture:sleep=30000]'));
+  const running = await until(async () => {
+    const state = await ctx.manager.status(a.task_id);
+    return state.status === 'running' && state;
+  });
+  assert.deepEqual(await hostCall(ctx.config, 'releaseWorkspace', {
+    instance: running.appServer.instance, workspacePath: ctx.workspace, identities: ['stale-identity'],
+  }), { released: false, reason: 'runtime-changed' });
+  assert.deepEqual(await hostCall(ctx.config, 'identity', { workspacePath: ctx.workspace }), running.runtimeIdentity);
+});
+
+test('a workspace runtime exit fails its task without restarting the process for cleanup', async (t) => {
+  const ctx = await setup(t);
+  const task = await ctx.manager.spawn(input(ctx, 'runtime-exit', '[fixture:runtime-exit]'));
+  const result = await released(ctx, task.task_id);
+  assert.equal(result.status, 'failed');
+  assert.equal(result.resourceCleanup.reason, 'already-absent');
+  assert.equal((await hostHealth(ctx.config)).hostPid, result.appServer.hostPid);
+  await assert.rejects(hostCall(ctx.config, 'identity', { workspacePath: ctx.workspace }), /runtime identity is unavailable/);
+});
+
+test('an old adapter drains active tasks before replacement and then dispatches retained queued work', async (t) => {
+  const ctx = await setup(t);
+  const old = await legacyHost(ctx.config);
+  const short = await ctx.manager.spawn(input(ctx, 'old-short'));
+  const long = await ctx.manager.spawn(input(ctx, 'old-long', '[fixture:sleep=4500]'));
+  await done(ctx, short.task_id);
+  await until(() => ctx.manager.resources.upgrade?.status === 'draining');
+  const queued = await ctx.manager.spawn(input(ctx, 'new-queued'));
+  await delay(500);
+  assert.equal((await ctx.manager.status(queued.task_id)).status, 'queued');
+  assert.equal((await ctx.manager.status(long.task_id)).status, 'running');
+  assert.equal((await hostHealth(ctx.config)).hostPid, old.hostPid);
+  assert.equal((await done(ctx, long.task_id)).status, 'succeeded');
+  assert.equal((await released(ctx, short.task_id)).status, 'succeeded');
+  const result = await released(ctx, queued.task_id);
+  assert.equal(result.status, 'succeeded');
+  assert.notEqual(result.appServer.hostPid, old.hostPid);
+  assert.equal((await hostHealth(ctx.config)).capabilities.workspaceRelease, true);
+  assert.equal(ctx.manager.resources.upgrade, undefined);
 });
 
 test('12 jobs execute, the 13th queues, cancellation releases a slot, request retries are idempotent', async (t) => {
@@ -183,6 +275,8 @@ test('a crashed worker stops its session without killing the shared Host or repl
   process.kill(owner.pid, 'SIGKILL');
   const result = await done(ctx, task.task_id);
   assert.equal(result.status, 'interrupted');
+  await released(ctx, task.task_id);
+  await assert.rejects(hostCall(ctx.config, 'identity', { workspacePath: ctx.workspace }), /runtime identity is unavailable/);
   assert.equal((await hostHealth(ctx.config)).hostPid, before.hostPid);
   assert.equal((await ctx.manager.list()).length, 1);
 });

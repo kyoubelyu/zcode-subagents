@@ -416,7 +416,8 @@ async function startHost(config = settings()) {
     hostPid: rpc.child.pid,
     hostIdentity: await processIdentity(rpc.child.pid),
     desktopVersion: hello.version,
-    runtimeRoot: runtime.root
+    runtimeRoot: runtime.root,
+    capabilities: { workspaceRelease: true }
   };
   const agent = (method, params) => rpc.call("zcode-agent", method, [params]);
   const command = async (params, type, payload, commandId) => {
@@ -494,6 +495,23 @@ async function startHost(config = settings()) {
         case "identity":
           result = await agent("getWorkspaceRuntimeIdentity", { workspacePath: p.workspacePath });
           break;
+        case "releaseWorkspace": {
+          let identity;
+          try {
+            identity = await agent("getWorkspaceRuntimeIdentity", { workspacePath: p.workspacePath });
+          } catch (error) {
+            if (!/runtime identity is unavailable/i.test(error.message)) throw error;
+            result = { released: true, reason: "already-absent" };
+            break;
+          }
+          if (p.identities?.length && !p.identities.includes(identity.identity)) {
+            result = { released: false, reason: "runtime-changed" };
+            break;
+          }
+          await agent("disposeWorkspace", { workspacePath: p.workspacePath });
+          result = { released: true, reason: "idle-workspace", runtimeIdentity: identity };
+          break;
+        }
         case "send":
           result = await command(p, "sendText", {
             text: p.prompt,
@@ -504,9 +522,22 @@ async function startHost(config = settings()) {
             toolDisallowlist: DENIED_TOOLS
           }, p.commandId);
           break;
-        case "stop":
+        case "stop": {
+          let identity;
+          try {
+            identity = await agent("getWorkspaceRuntimeIdentity", { workspacePath: p.workspacePath });
+          } catch (error) {
+            if (!/runtime identity is unavailable/i.test(error.message)) throw error;
+            result = { runtimeEnded: true };
+            break;
+          }
+          if (p.runtimeIdentity && p.runtimeIdentity.identity !== identity.identity) {
+            result = { runtimeEnded: true };
+            break;
+          }
           result = await command(p, "stop", {}, p.commandId || newId());
           break;
+        }
         case "close":
           result = await agent("closeSession", target);
           break;

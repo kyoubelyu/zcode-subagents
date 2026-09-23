@@ -65,3 +65,33 @@ the same-version supervisor's missing entry/worker files and replaces only that
 owned supervisor after verifying its process identity. Workers and the Host
 survive; queued work is not dispatched from a deleted cache. This updates plugin
 processes only, never the installed desktop runtime.
+
+## Idle workspace lifecycle
+
+The 12-task execution limit does not bound resident workspace runtimes. After
+tasks end, the supervisor must release their idle workspace app-server through
+the official Host's disposeWorkspace API. The shared Host remains available;
+runtime files, durable conversations, results and Git worktrees are retained.
+Followups cold-resume the same session and workspace when necessary.
+
+Resource cleanup runs inside the serialized scheduler tick, before dispatching
+new workers. Any starting/preparing/running/cleanup_pending task protects its
+workspace, including workers whose runtime metadata is not yet written. Release
+requests must match the recorded Host instance and workspace runtime identity.
+Read-only identity checks never start an agent. Missing/replaced runtimes are
+handled without stopping an unrelated instance. Cleanup errors are recorded and
+retried separately from the task outcome. Supervisor restart also sweeps retained
+terminal task records so idle runtimes are not forgotten after a client exits.
+
+Acceptance: completed tasks in separate workspaces leave no resident workspace
+agents; a task sharing a workspace with an active sibling cannot release it;
+the Host survives; a followup resumes durable context after process release;
+failed/cancelled/crashed workers are reclaimed once stopped; result files and
+worktrees remain intact. History entries in ZCode's UI are not deleted by this
+resource cleanup.
+
+An adapter predating workspace release is migrated once: the scheduler drains
+active workers, retains queued tasks, verifies the owned adapter's process
+identity, closes it gracefully, and starts the updated plugin adapter using the
+same desktop files. Runtime executables and account configuration are untouched.
+Doctor reports a pending/draining adapter update. Healthy capable Hosts are reused.

@@ -31,8 +31,10 @@ export async function runWorker(config, id) {
   await save();
   try {
     state.workspace = await prepareWorkspace(spec, dir);
+    await save();
     if (await readJson(path.join(dir, 'cancel.json'))) { state.status = 'cancelled'; return; }
     state.appServer = await ensureHost(config);
+    await save();
     state.effectiveModel = await hostCall(config, 'resolveModel', { model: spec.model, instance: state.appServer.instance });
     const snapshot = await hostCall(config, spec.sessionId ? 'resume' : 'create', {
       instance: state.appServer.instance, workspacePath: state.workspace, sessionId: spec.sessionId, kind: spec.kind,
@@ -89,9 +91,11 @@ export async function runWorker(config, id) {
     if (state.sessionId && !terminal) {
       // A lost send reply can still mean accepted work. Never resend or kill the shared Host.
       try {
-        await hostCall(config, 'stop', { ...params(), commandId: id + '-cleanup' });
-        const current = await hostCall(config, 'snapshot', params());
-        if (runningConversation(current)) state.status = 'cleanup_pending';
+        const stopped = await hostCall(config, 'stop', { ...params(), commandId: id + '-cleanup' });
+        if (!stopped.runtimeEnded) {
+          const current = await hostCall(config, 'snapshot', params());
+          if (runningConversation(current)) state.status = 'cleanup_pending';
+        }
       } catch {
         if (await sameProcess({ pid: state.appServer.hostPid, identity: state.appServer.hostIdentity })) state.status = 'cleanup_pending';
       }

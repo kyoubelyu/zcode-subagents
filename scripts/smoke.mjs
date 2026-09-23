@@ -7,6 +7,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
+import { setTimeout as delay } from 'node:timers/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
@@ -31,11 +32,24 @@ const finish = async (task) => {
     wait = await command('wait', wait ? { wait_id: wait.wait_id } : { task_ids: [task.task_id] });
     console.log('Progress:', wait.tasks.map((t) => t.status).join(', '));
   } while (!wait.ready && !wait.timed_out);
-  const result = await command('status', { task_id: task.task_id });
+  let result = await command('status', { task_id: task.task_id });
   console.log(JSON.stringify({ task_id: result.task_id, status: result.status, response: result.response,
     error: result.error, effectiveModel: result.effectiveModel, sessionId: result.sessionId, workspace: result.workspace }));
   assert.equal(result.status, 'succeeded', result.error);
   assert.deepEqual(result.observedModel, result.effectiveModel);
+  const deadline = Date.now() + 20000;
+  while (result.resourceCleanup?.status !== 'released' && Date.now() < deadline) {
+    await delay(200);
+    result = await command('status', { task_id: task.task_id });
+  }
+  assert.equal(result.resourceCleanup?.status, 'released', JSON.stringify(result.resourceCleanup));
+  const alive = async () => {
+    try { return (await fs.readFile('/proc/' + result.runtimeIdentity.processId + '/stat', 'utf8')).split(') ')[1][0] !== 'Z'; }
+    catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+  };
+  while (await alive() && Date.now() < deadline) await delay(200);
+  assert.equal(await alive(), false, 'Completed workspace process is still running');
+  console.log('Released workspace process:', result.runtimeIdentity.processId);
   return result;
 };
 const hashRuntime = async (runtime) => Object.fromEntries(await Promise.all([
@@ -79,6 +93,7 @@ try {
   const continued = await finish(await command('followup', { task_id: edited.task_id, request_key: 'inherit',
     prompt: 'Without tools or further edits, name the two files you just changed and reply with FOLLOWUP_OK.', run_timeout_ms: 180000 }));
   assert.equal(continued.sessionId, edited.sessionId); assert.deepEqual(continued.effectiveModel, edited.effectiveModel);
+  assert.notEqual(continued.runtimeIdentity.identity, edited.runtimeIdentity.identity);
   assert.match(continued.response, /FOLLOWUP_OK/); assert.match(continued.response, /test_arithmetic.py/);
   const reset = await finish(await command('followup', { task_id: continued.task_id, request_key: 'reset-default', model: 'default',
     prompt: 'Reply with exactly RESET_DEFAULT_OK. Do not use tools or edit files.', run_timeout_ms: 180000 }));

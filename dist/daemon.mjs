@@ -8,13 +8,13 @@ var __export = (target, all) => {
 // src/daemon.mjs
 import http2 from "node:http";
 import { promises as fs5 } from "node:fs";
-import path5 from "node:path";
+import path6 from "node:path";
 import { fileURLToPath as fileURLToPath3 } from "node:url";
 
 // src/supervisor.mjs
 import { promises as fs3, openSync as openSync2, closeSync as closeSync2 } from "node:fs";
 import { spawn as spawn2 } from "node:child_process";
-import path3 from "node:path";
+import path4 from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/common.mjs
@@ -211,18 +211,115 @@ async function ensureHost(config2) {
 // src/conversation.mjs
 var runningConversation = (snapshot) => snapshot.control.canStop || ["running", "prewarming"].includes(snapshot.control.phase);
 
+// src/resources.mjs
+import path3 from "node:path";
+var activeTask = (status) => ["starting", "preparing", "running", "cleanup_pending"].includes(status);
+var workspaceFor = (task) => task.state.workspace || task.spec.workspace || (task.spec.kind === "analysis" ? task.spec.cwd : path3.join(task.dir, "worktree"));
+var ResourceReaper = class {
+  constructor(config2) {
+    this.config = config2;
+    this.retryAfter = /* @__PURE__ */ new Map();
+  }
+  async refreshAdapter(host, busy) {
+    if (host.capabilities?.workspaceRelease) {
+      this.upgrade = void 0;
+      return host;
+    }
+    this.upgrade = { status: "draining", reason: "Waiting for active tasks before updating the plugin Host adapter." };
+    if (busy.size) return;
+    this.upgrade.status = "replacing";
+    const owner = await readJson(path3.join(this.config.home, "host-owner.json"));
+    if (owner?.instance !== host.instance || owner.pid !== host.pid || !await sameProcess(owner)) {
+      throw new Error("Host adapter changed during update; retrying after identity verification.");
+    }
+    process.kill(owner.pid, "SIGTERM");
+    const native = { pid: host.hostPid, identity: host.hostIdentity };
+    const deadline = Date.now() + 15e3;
+    while ((await sameProcess(owner) || await sameProcess(native)) && Date.now() < deadline) await delay(100);
+    if (await sameProcess(owner) || await sameProcess(native)) throw new Error("Previous Host adapter is still closing.");
+    const updated = await ensureHost(this.config);
+    if (!updated.capabilities?.workspaceRelease) throw new Error("Installed plugin adapter lacks workspace cleanup support.");
+    this.upgrade = void 0;
+    return updated;
+  }
+  // Called only by the scheduler while dispatch is paused. No other supervisor
+  // can start workers because the shared pool holds a lifetime flock.
+  async sweep(tasks) {
+    const busy = new Set(tasks.filter((t) => activeTask(t.state.status)).map(workspaceFor));
+    const groups = /* @__PURE__ */ new Map();
+    for (const task of tasks) {
+      const s = task.state;
+      if (!TERMINAL.has(s.status) || !s.appServer || !s.workspace || s.resourceCleanup?.status === "released" || busy.has(s.workspace)) continue;
+      const key = s.appServer.instance + ":" + s.workspace;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(task);
+    }
+    if (!groups.size && !tasks.some((t) => TERMINAL.has(t.state.status) && t.state.appServer && t.state.resourceCleanup?.status !== "released")) return true;
+    let host;
+    try {
+      host = await hostHealth(this.config);
+    } catch {
+      return true;
+    }
+    try {
+      host = await this.refreshAdapter(host, busy);
+    } catch (error62) {
+      this.upgrade = { status: "pending", error: error62.message };
+      return false;
+    }
+    if (!host) return false;
+    for (const [key, group] of groups) {
+      if (Date.now() < (this.retryAfter.get(key) || 0)) continue;
+      const first = group[0].state;
+      let result;
+      try {
+        if (first.appServer.instance !== host.instance) {
+          if (await sameProcess({ pid: first.appServer.hostPid, identity: first.appServer.hostIdentity })) {
+            throw new Error("Previous Host is still alive; its workspace cannot be released through a replacement Host.");
+          }
+          result = { released: true, reason: "host-ended" };
+        } else {
+          if (!host.capabilities?.workspaceRelease) throw new Error("Host adapter needs the idle-workspace cleanup update.");
+          result = await hostCall(this.config, "releaseWorkspace", {
+            instance: host.instance,
+            workspacePath: first.workspace,
+            identities: [...new Set(group.map((t) => t.state.runtimeIdentity?.identity).filter(Boolean))]
+          });
+          if (!result.released) throw new Error("Workspace not released: " + result.reason);
+        }
+        this.retryAfter.delete(key);
+      } catch (error62) {
+        this.retryAfter.set(key, Date.now() + 5e3);
+        result = { released: false, error: error62.message };
+      }
+      for (const task of group) {
+        task.state = { ...task.state, resourceCleanup: {
+          status: result.released ? "released" : "pending",
+          at: now(),
+          historyRetained: true,
+          reason: result.reason,
+          error: result.error
+        } };
+        await atomicJson(path3.join(task.dir, "runtime.json"), task.state);
+      }
+    }
+    return true;
+  }
+};
+
 // src/supervisor.mjs
 var workerPath = fileURLToPath2(new URL("./worker.mjs", import.meta.url));
-var active = (state) => ["starting", "preparing", "running", "cleanup_pending"].includes(state);
+var active = activeTask;
 var Supervisor = class {
   constructor(config2) {
     this.config = config2;
     this.tickBusy = false;
     this.mutations = Promise.resolve();
+    this.resources = new ResourceReaper(config2);
   }
   async init() {
-    await privateDir(path3.join(this.config.home, "tasks"));
-    await privateDir(path3.join(this.config.home, "waits"));
+    await privateDir(path4.join(this.config.home, "tasks"));
+    await privateDir(path4.join(this.config.home, "waits"));
     await this.tick();
     this.timer = setInterval(() => {
       this.tick().catch((e) => console.error(e.message));
@@ -240,13 +337,13 @@ var Supervisor = class {
     return next;
   }
   async ids() {
-    return (await fs3.readdir(path3.join(this.config.home, "tasks"))).filter((id2) => /^[a-f0-9-]{36}$/.test(id2));
+    return (await fs3.readdir(path4.join(this.config.home, "tasks"))).filter((id2) => /^[a-f0-9-]{36}$/.test(id2));
   }
   async task(id2) {
     const dir = taskDir(this.config, id2);
-    const spec = await readJson(path3.join(dir, "spec.json"));
+    const spec = await readJson(path4.join(dir, "spec.json"));
     if (!spec) throw new Error("Task not found: " + id2);
-    const state = await readJson(path3.join(dir, "runtime.json"), { status: "queued" });
+    const state = await readJson(path4.join(dir, "runtime.json"), { status: "queued" });
     return { spec, state, dir };
   }
   async status(id2) {
@@ -260,9 +357,9 @@ var Supervisor = class {
       ...state,
       artifacts: {
         directory: dir,
-        worker: path3.join(dir, "worker.log"),
-        ...state.backend === "desktop-app-server" ? { progress: path3.join(dir, "progress.jsonl") } : { stdout: path3.join(dir, "stdout.log"), stderr: path3.join(dir, "stderr.log") },
-        result: path3.join(dir, "result.json")
+        worker: path4.join(dir, "worker.log"),
+        ...state.backend === "desktop-app-server" ? { progress: path4.join(dir, "progress.jsonl") } : { stdout: path4.join(dir, "stdout.log"), stderr: path4.join(dir, "stderr.log") },
+        result: path4.join(dir, "result.json")
       }
     };
   }
@@ -298,7 +395,7 @@ var Supervisor = class {
         createdAt: now(),
         ...context
       };
-      await atomicJson(path3.join(taskDir(this.config, id2), "spec.json"), spec);
+      await atomicJson(path4.join(taskDir(this.config, id2), "spec.json"), spec);
       return this.status(id2);
     });
   }
@@ -332,14 +429,14 @@ var Supervisor = class {
         runTimeoutMs: input2.run_timeout_ms || 0,
         model: input2.model
       };
-      await atomicJson(path3.join(taskDir(this.config, id2), "spec.json"), spec);
+      await atomicJson(path4.join(taskDir(this.config, id2), "spec.json"), spec);
       return this.status(id2);
     });
   }
   async cancel(id2) {
     const task = await this.task(id2);
     if (TERMINAL.has(task.state.status)) return this.status(id2);
-    await atomicJson(path3.join(task.dir, "cancel.json"), { reason: "Cancelled by caller", at: now() });
+    await atomicJson(path4.join(task.dir, "cancel.json"), { reason: "Cancelled by caller", at: now() });
     await this.tick();
     return this.status(id2);
   }
@@ -352,10 +449,10 @@ var Supervisor = class {
       const busyWorkspaces = /* @__PURE__ */ new Set();
       for (const task of tasks) {
         if (!active(task.state.status)) continue;
-        const owner = await readJson(path3.join(task.dir, "owner.json"));
+        const owner = await readJson(path4.join(task.dir, "owner.json"));
         if (await sameProcess(owner) || !owner && Date.now() - Date.parse(task.state.startedAt) < 1e4) {
           count++;
-          if (task.state.workspace) busyWorkspaces.add(task.state.workspace);
+          busyWorkspaces.add(workspaceFor(task));
         } else {
           task.state = (await this.task(task.spec.id)).state;
           if (!active(task.state.status)) continue;
@@ -363,16 +460,23 @@ var Supervisor = class {
             const host = task.state.appServer;
             if (await sameProcess({ pid: host.hostPid, identity: host.hostIdentity })) {
               try {
-                const params = { instance: host.instance, workspacePath: task.state.workspace, sessionId: task.state.sessionId };
-                await hostCall(this.config, "stop", params);
-                const snapshot = await hostCall(this.config, "snapshot", params);
-                if (runningConversation(snapshot)) {
-                  count++;
-                  continue;
+                const params = {
+                  instance: host.instance,
+                  workspacePath: task.state.workspace,
+                  sessionId: task.state.sessionId,
+                  runtimeIdentity: task.state.runtimeIdentity
+                };
+                const stopped = await hostCall(this.config, "stop", params);
+                if (!stopped.runtimeEnded) {
+                  const snapshot = await hostCall(this.config, "snapshot", params);
+                  if (runningConversation(snapshot)) {
+                    count++;
+                    continue;
+                  }
                 }
               } catch {
                 count++;
-                if (task.state.status !== "cleanup_pending") await atomicJson(path3.join(task.dir, "runtime.json"), {
+                if (task.state.status !== "cleanup_pending") await atomicJson(path4.join(task.dir, "runtime.json"), {
                   ...task.state,
                   status: "cleanup_pending",
                   error: "Worker stopped; waiting to confirm its app-server session has stopped."
@@ -381,10 +485,10 @@ var Supervisor = class {
               }
             }
           }
-          const child = await readJson(path3.join(task.dir, "child.json"));
+          const child = await readJson(path4.join(task.dir, "child.json"));
           if (await sameProcess(child)) {
             task.state.orphanedAt ||= now();
-            await atomicJson(path3.join(task.dir, "runtime.json"), task.state);
+            await atomicJson(path4.join(task.dir, "runtime.json"), task.state);
             const signal = Date.now() - Date.parse(task.state.orphanedAt) > 8e3 ? "SIGKILL" : "SIGTERM";
             try {
               process.kill(-child.pid, signal);
@@ -405,14 +509,15 @@ var Supervisor = class {
             finishedAt: now(),
             error: task.state.error || "Worker exited without a final result. Inspect artifacts before explicitly retrying."
           };
-          await atomicJson(path3.join(task.dir, "runtime.json"), task.state);
+          await atomicJson(path4.join(task.dir, "runtime.json"), task.state);
         }
       }
+      if (!await this.resources.sweep(tasks)) return;
       tasks.sort((a, b) => a.spec.createdAt.localeCompare(b.spec.createdAt));
       for (const task of tasks) {
         if (task.state.status !== "queued") continue;
-        if (await readJson(path3.join(task.dir, "cancel.json"))) {
-          await atomicJson(path3.join(task.dir, "runtime.json"), { status: "cancelled", finishedAt: now() });
+        if (await readJson(path4.join(task.dir, "cancel.json"))) {
+          await atomicJson(path4.join(task.dir, "runtime.json"), { status: "cancelled", finishedAt: now() });
           continue;
         }
         if (count >= this.config.concurrency) continue;
@@ -426,7 +531,7 @@ var Supervisor = class {
           const parent = await this.task(task.spec.parentTaskId);
           if (!TERMINAL.has(parent.state.status)) continue;
           if (!parent.state.sessionId || !parent.state.workspace) {
-            await atomicJson(path3.join(task.dir, "runtime.json"), {
+            await atomicJson(path4.join(task.dir, "runtime.json"), {
               status: "failed",
               finishedAt: now(),
               error: "Parent task has no resumable session."
@@ -436,15 +541,15 @@ var Supervisor = class {
           task.spec.sessionId = parent.state.sessionId;
           task.spec.workspace = parent.state.workspace;
           task.spec.model ??= parent.state.effectiveModel || parent.spec.model;
-          await atomicJson(path3.join(task.dir, "spec.json"), task.spec);
+          await atomicJson(path4.join(task.dir, "spec.json"), task.spec);
         }
         if (task.spec.workspace && busyWorkspaces.has(task.spec.workspace)) continue;
-        await atomicJson(path3.join(task.dir, "runtime.json"), {
+        await atomicJson(path4.join(task.dir, "runtime.json"), {
           status: "starting",
           startedAt: now(),
           workspace: task.spec.workspace
         });
-        const log = openSync2(path3.join(task.dir, "worker.log"), "a", 384);
+        const log = openSync2(path4.join(task.dir, "worker.log"), "a", 384);
         try {
           const worker = spawn2(process.execPath, [workerPath, task.spec.id], {
             env: {
@@ -456,7 +561,7 @@ var Supervisor = class {
             detached: true
           });
           worker.once("error", (error62) => {
-            atomicJson(path3.join(task.dir, "runtime.json"), {
+            atomicJson(path4.join(task.dir, "runtime.json"), {
               status: "failed",
               error: error62.message,
               finishedAt: now()
@@ -477,7 +582,7 @@ var Supervisor = class {
     let wait;
     let id2 = input2.wait_id;
     if (id2) {
-      wait = await readJson(path3.join(this.config.home, "waits", validWaitId(id2) + ".json"));
+      wait = await readJson(path4.join(this.config.home, "waits", validWaitId(id2) + ".json"));
       if (!wait) throw new Error("Wait not found.");
     } else {
       if (!input2.task_ids?.length) throw new Error("task_ids is required for a new wait.");
@@ -486,7 +591,7 @@ var Supervisor = class {
       for (const taskId of input2.task_ids) await this.task(taskId);
       id2 = newId();
       wait = { ids: input2.task_ids, mode: input2.mode || "all", deadline: Date.now() + timeout };
-      await atomicJson(path3.join(this.config.home, "waits", id2 + ".json"), wait);
+      await atomicJson(path4.join(this.config.home, "waits", id2 + ".json"), wait);
     }
     const sliceEnd = Math.min(Date.now() + Math.min(sliceMs, 5e4), wait.deadline);
     let tasks;
@@ -1328,10 +1433,10 @@ function mergeDefs(...defs) {
 function cloneDef(schema) {
   return mergeDefs(schema._zod.def);
 }
-function getElementAtPath(obj, path6) {
-  if (!path6)
+function getElementAtPath(obj, path7) {
+  if (!path7)
     return obj;
-  return path6.reduce((acc, key) => acc?.[key], obj);
+  return path7.reduce((acc, key) => acc?.[key], obj);
 }
 function promiseAllObject(promisesObj) {
   const keys = Object.keys(promisesObj);
@@ -1671,11 +1776,11 @@ function explicitlyAborted(x, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path6, issues) {
+function prefixIssues(path7, issues) {
   return issues.map((iss) => {
     var _a3;
     (_a3 = iss).path ?? (_a3.path = []);
-    iss.path.unshift(path6);
+    iss.path.unshift(path7);
     return iss;
   });
 }
@@ -2125,16 +2230,16 @@ function flattenError(error62, mapper = (issue2) => issue2.message) {
 }
 function formatError(error62, mapper = (issue2) => issue2.message) {
   const fieldErrors = { _errors: [] };
-  const processError = (error63, path6 = []) => {
+  const processError = (error63, path7 = []) => {
     for (const issue2 of error63.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
-        issue2.errors.map((issues) => processError({ issues }, [...path6, ...issue2.path]));
+        issue2.errors.map((issues) => processError({ issues }, [...path7, ...issue2.path]));
       } else if (issue2.code === "invalid_key") {
-        processError({ issues: issue2.issues }, [...path6, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path7, ...issue2.path]);
       } else if (issue2.code === "invalid_element") {
-        processError({ issues: issue2.issues }, [...path6, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path7, ...issue2.path]);
       } else {
-        const fullpath = [...path6, ...issue2.path];
+        const fullpath = [...path7, ...issue2.path];
         if (fullpath.length === 0) {
           fieldErrors._errors.push(mapper(issue2));
         } else {
@@ -2173,17 +2278,17 @@ function formatError(error62, mapper = (issue2) => issue2.message) {
 }
 function treeifyError(error62, mapper = (issue2) => issue2.message) {
   const result = { errors: [] };
-  const processError = (error63, path6 = []) => {
+  const processError = (error63, path7 = []) => {
     var _a3;
     for (const issue2 of error63.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
-        issue2.errors.map((issues) => processError({ issues }, [...path6, ...issue2.path]));
+        issue2.errors.map((issues) => processError({ issues }, [...path7, ...issue2.path]));
       } else if (issue2.code === "invalid_key") {
-        processError({ issues: issue2.issues }, [...path6, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path7, ...issue2.path]);
       } else if (issue2.code === "invalid_element") {
-        processError({ issues: issue2.issues }, [...path6, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path7, ...issue2.path]);
       } else {
-        const fullpath = [...path6, ...issue2.path];
+        const fullpath = [...path7, ...issue2.path];
         if (fullpath.length === 0) {
           result.errors.push(mapper(issue2));
           continue;
@@ -2222,8 +2327,8 @@ function treeifyError(error62, mapper = (issue2) => issue2.message) {
 }
 function toDotPath(_path) {
   const segs = [];
-  const path6 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
-  for (const seg of path6) {
+  const path7 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
+  for (const seg of path7) {
     if (typeof seg === "number")
       segs.push(`[${seg}]`);
     else if (typeof seg === "symbol")
@@ -19325,13 +19430,13 @@ function resolveRef(ref, ctx) {
   if (!ref.startsWith("#")) {
     throw new Error("External $ref is not supported, only local refs (#/...) are allowed");
   }
-  const path6 = ref.slice(1).split("/").filter(Boolean);
-  if (path6.length === 0) {
+  const path7 = ref.slice(1).split("/").filter(Boolean);
+  if (path7.length === 0) {
     return ctx.rootSchema;
   }
   const defsKey = ctx.version === "draft-2020-12" ? "$defs" : "definitions";
-  if (path6[0] === defsKey) {
-    const key = path6[1] === void 0 ? void 0 : decodeJSONPointerSegment(path6[1]);
+  if (path7[0] === defsKey) {
+    const key = path7[1] === void 0 ? void 0 : decodeJSONPointerSegment(path7[1]);
     if (!key || !ctx.defs[key]) {
       throw new Error(`Reference not found: ${ref}`);
     }
@@ -20231,12 +20336,12 @@ function validate2(method, params) {
 
 // src/desktop-runtime.mjs
 import { promises as fs4 } from "node:fs";
-import path4 from "node:path";
+import path5 from "node:path";
 import os2 from "node:os";
 async function desktopRuntime(config2) {
-  const root = path4.resolve(config2.runtimeRoot || path4.join(os2.homedir(), ".zcode/server"));
-  const runtime = { root, node: path4.join(root, "node"), entry: path4.join(root, "zcode-server.cjs"), cwd: config2.home };
-  for (const file2 of [runtime.node, runtime.entry, path4.join(root, "agents/glm/zcode.cjs")]) {
+  const root = path5.resolve(config2.runtimeRoot || path5.join(os2.homedir(), ".zcode/server"));
+  const runtime = { root, node: path5.join(root, "node"), entry: path5.join(root, "zcode-server.cjs"), cwd: config2.home };
+  for (const file2 of [runtime.node, runtime.entry, path5.join(root, "agents/glm/zcode.cjs")]) {
     try {
       if (!(await fs4.stat(file2)).isFile()) throw new Error();
     } catch {
@@ -20250,10 +20355,10 @@ async function desktopRuntime(config2) {
 async function startDaemon(config2 = settings()) {
   process.umask(63);
   await privateDir(config2.home);
-  const lockPath = path5.join(config2.home, "supervisor.lock");
+  const lockPath = path6.join(config2.home, "supervisor.lock");
   if (process.env.ZCODE_SUBAGENTS_LOCKED !== "1") throw new Error("Launch the supervisor through the plugin command.");
   await privateDir(lockPath);
-  await atomicJson(path5.join(lockPath, "owner.json"), {
+  await atomicJson(path6.join(lockPath, "owner.json"), {
     pid: process.pid,
     identity: await processIdentity(process.pid),
     version: VERSION
@@ -20327,6 +20432,7 @@ async function startDaemon(config2 = settings()) {
             backend: "desktop-app-server",
             appServer,
             data_directory: config2.home,
+            resource_cleanup: { policy: "release-idle-workspaces", adapter_update: supervisor.resources.upgrade },
             wait: { default_ms: 9e5, min_ms: 6e5, max_ms: 18e5, slice_ms: 2e4 }
           };
           break;
@@ -20365,7 +20471,7 @@ async function startDaemon(config2 = settings()) {
   });
   return { server, supervisor, close };
 }
-if (process.argv[1] && path5.resolve(process.argv[1]) === fileURLToPath3(import.meta.url)) {
+if (process.argv[1] && path6.resolve(process.argv[1]) === fileURLToPath3(import.meta.url)) {
   startDaemon().catch((error62) => {
     console.error(error62.message);
     process.exitCode = 1;

@@ -24,11 +24,14 @@ Version **0.2 uses the existing desktop runtime directly**, with the direct plug
 
 The plugin starts a Host from the desktop's existing files when needed and reuses **its own** Host instance across clients and tasks. That official Host starts and reuses workspace app-servers and handles ZCode account authentication. The plugin does not attach to private stdio pipes belonging to the running desktop application.
 
+When a workspace has no active tasks, the supervisor releases its app-server through ZCode's `disposeWorkspace` API. The shared Host stays alive. Conversation history, results and worktrees are retained; a followup starts a fresh workspace process and resumes the same session. Completed tasks therefore do not each leave a resident ZCode/Node process behind.
+
 The plugin does **not** download, install, build, upgrade, patch, or vendor ZCode's runtime. It holds the connection needed to use it. It does not supervise runtime upgrades or automatically replay work after a crash. A later explicit request can start a fresh instance from the same files.
 
 - **At most 12 active tasks** across clients using the same data directory; extra tasks queue.
 - **Persistent task IDs and results.** MCP disconnection, client exit and supervisor restart preserve work.
 - **Linear followups** in the same session and workspace, with model inheritance or an explicit override.
+- **Automatic process cleanup** after a workspace's tasks stop, including failed and cancelled tasks. Active tasks protect their workspace from cleanup.
 - **Isolated edits** in Git worktrees. The source repository must have a commit and be clean, including ordinary untracked files.
 - **Cancellation targets one session.** It does not kill the shared Host or another task.
 - **Idempotent submissions.** Identical workflow/request keys return the existing task; conflicting reuse is rejected.
@@ -147,7 +150,7 @@ Example explicit override, using IDs returned by `models`:
 
 If an explicit selection omits reasoning, the resolver uses the last level in the model's advertised ordering (the tested GLM models advertise `low`, `high`, `max`). Pass a level for deterministic behavior. Unknown models or unsupported reasoning levels fail; there is no silent fallback.
 
-Per-input overrides do not change the configured default. Status records `requestedModel`, `effectiveModel`, and the app-server's `observedModel`. No model ID is hardcoded as the plugin default. On the machine used for the live test, the default was **GLM-5.3-Flash / max**.
+Per-input overrides do not change the configured default. Status records `requestedModel`, `effectiveModel`, and the app-server's `observedModel`. No model ID is hardcoded as the plugin default; read `zcode_models` for the current selection.
 
 For a followup, pass `task_id`, a new `request_key`, and `prompt`; optionally pass `model`. Followups wait for their parent to finish. Continue from the returned task ID, since sibling followups are rejected. This does not steer an in-progress turn.
 
@@ -158,6 +161,10 @@ Waits default to **15 minutes**, accept **10–30 minutes**, and return after at
 The plugin uses V4 commands and authoritative conversation snapshots. `succeeded` means it observed the submitted turn finish successfully with an assistant response. It does not mean the generated code is correct or its suggested tests ran. Usage is the session's cumulative usage, including earlier followup turns.
 
 After a worker crash, the supervisor stops that session before releasing its slot. If it cannot confirm that work stopped, `cleanup_pending` keeps the slot occupied. A Host or workspace app-server replacement fails the affected task without resubmitting it. Review failed/interrupted artifacts before explicitly retrying.
+
+Process cleanup runs on the supervisor's next scheduler tick once all tasks in that workspace are terminal. `resourceCleanup.status: "released"` confirms release; `"pending"` records a cleanup error and retries independently of the task result. A supervisor restart also checks historical completed tasks. Cleanup checks runtime identity, keeps other workspaces running, and never restarts a missing process just to stop it. Retained conversations still appear in ZCode's history; process cleanup does not delete them.
+
+On the first upgrade from an adapter without process cleanup, queued tasks wait for existing workers to finish. The supervisor then replaces its own connection adapter and Host, using the same installed runtime files, before dispatching the queue. `zcode_doctor.resource_cleanup.adapter_update` reports this transition. Subsequent cleanup releases individual workspace processes and keeps the shared Host.
 
 Edit results include the worktree, branch, `changes.patch`, and `untrackedFiles`. Review both tracked and new files. No changes are automatically merged into your checkout. Remove worktrees only after retaining the changes you want.
 
@@ -186,7 +193,7 @@ npm ci
 npm run check
 ```
 
-Tests use a fake desktop Host and temporary repositories, with no model credentials. They cover all eight MCP tools, task recovery after an MCP disconnect, tool-error isolation, the 12-task cap, queue, deduplication, default/explicit models, followup inheritance, isolated edits, cancellation, wait deadlines, client exit, supervisor restart, worker/Host crashes, and binary/snapshot framing.
+Tests use a fake desktop Host and temporary repositories, with no model credentials. They cover all eight MCP tools, task recovery after an MCP disconnect, tool-error isolation, the 12-task cap, queue, deduplication, default/explicit models, followup inheritance, isolated edits, cancellation, idle process release, cold session resume, runtime identity guards, wait deadlines, client exit, supervisor restart, worker/Host crashes, and binary/snapshot framing.
 
 A separate live test consumes provider quota:
 
@@ -194,6 +201,6 @@ A separate live test consumes provider quota:
 node scripts/smoke.mjs
 ```
 
-It calls the MCP tools to check the default model, an explicit override, a real edit and Python tests, followup inheritance, reset to `default`, Host reuse, and unchanged runtime-file hashes/default selection. Set `ZCODE_SUBAGENTS_SMOKE_MODEL` to a JSON model object to choose its explicit override. Set `ZCODE_SUBAGENTS_SMOKE_SERVER` to test an installed `dist/server.mjs`. Its temporary fixture and task artifacts are retained for inspection.
+It calls the MCP tools to check the default model, an explicit override, a real edit and Python tests, followup inheritance after the previous process exits, reset to `default`, Host reuse, and unchanged runtime-file hashes/default selection. It verifies every task's workspace process exits after completion. Set `ZCODE_SUBAGENTS_SMOKE_MODEL` to a JSON model object to choose its explicit override. Set `ZCODE_SUBAGENTS_SMOKE_SERVER` to test an installed `dist/server.mjs`. Its temporary fixture and task artifacts are retained for inspection.
 
 Commit rebuilt `dist/` with source changes. GitHub Actions checks tests and bundle consistency. Protocol implementation notes are in [docs/app-server.md](docs/app-server.md). The plugin is MIT licensed; bundled dependency notices are in [dist/THIRD-PARTY-NOTICES.txt](dist/THIRD-PARTY-NOTICES.txt).

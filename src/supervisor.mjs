@@ -7,15 +7,17 @@ import { atomicJson, readJson, privateDir, newId, taskDir, now, digest, sameProc
 import { inspectWorkspace } from './workspace.mjs';
 import { hostCall } from './host-client.mjs';
 import { runningConversation } from './conversation.mjs';
+import { ResourceReaper, activeTask, workspaceFor } from './resources.mjs';
 
 const workerPath = fileURLToPath(new URL('./worker.mjs', import.meta.url));
-const active = (state) => ['starting', 'preparing', 'running', 'cleanup_pending'].includes(state);
+const active = activeTask;
 
 export class Supervisor {
   constructor(config) {
     this.config = config;
     this.tickBusy = false;
     this.mutations = Promise.resolve();
+    this.resources = new ResourceReaper(config);
   }
   async init() {
     await privateDir(path.join(this.config.home, 'tasks'));
@@ -131,7 +133,7 @@ export class Supervisor {
         const owner = await readJson(path.join(task.dir, 'owner.json'));
         if (await sameProcess(owner) || (!owner && Date.now() - Date.parse(task.state.startedAt) < 10000)) {
           count++;
-          if (task.state.workspace) busyWorkspaces.add(task.state.workspace);
+          busyWorkspaces.add(workspaceFor(task));
         } else {
           // The worker can commit its final state and exit after this tick read
           // the initial snapshot. Re-read only after confirming the owner died.
@@ -143,10 +145,13 @@ export class Supervisor {
             const host = task.state.appServer;
             if (await sameProcess({ pid: host.hostPid, identity: host.hostIdentity })) {
               try {
-                const params = { instance: host.instance, workspacePath: task.state.workspace, sessionId: task.state.sessionId };
-                await hostCall(this.config, 'stop', params);
-                const snapshot = await hostCall(this.config, 'snapshot', params);
-                if (runningConversation(snapshot)) { count++; continue; }
+                const params = { instance: host.instance, workspacePath: task.state.workspace,
+                  sessionId: task.state.sessionId, runtimeIdentity: task.state.runtimeIdentity };
+                const stopped = await hostCall(this.config, 'stop', params);
+                if (!stopped.runtimeEnded) {
+                  const snapshot = await hostCall(this.config, 'snapshot', params);
+                  if (runningConversation(snapshot)) { count++; continue; }
+                }
               } catch {
                 count++;
                 if (task.state.status !== 'cleanup_pending') await atomicJson(path.join(task.dir, 'runtime.json'), {
@@ -175,6 +180,7 @@ export class Supervisor {
           await atomicJson(path.join(task.dir, 'runtime.json'), task.state);
         }
       }
+      if (!await this.resources.sweep(tasks)) return;
       tasks.sort((a, b) => a.spec.createdAt.localeCompare(b.spec.createdAt));
       for (const task of tasks) {
         if (task.state.status !== 'queued') continue;

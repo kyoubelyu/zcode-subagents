@@ -62,6 +62,7 @@ export async function startDaemon(config = settings()) {
           } catch (error) { appServer = { available: false, error: error.message }; }
           result = { version: VERSION, concurrency: config.concurrency, hard_limit: 12,
             backend: 'desktop-app-server', appServer, data_directory: config.home,
+            resource_cleanup: { policy: 'release-idle-workspaces', adapter_update: supervisor.resources.upgrade },
             wait: { default_ms: 900000, min_ms: 600000, max_ms: 1800000, slice_ms: 20000 } };
           break;
         }
