@@ -86,7 +86,15 @@ async function git(cwd, args, maxBuffer = 16 * 1024 * 1024) {
   return stdout;
 }
 async function prepareWorkspace(spec, dir) {
-  if (spec.workspace || spec.kind === "analysis") return spec.workspace || spec.cwd;
+  if (spec.workspace || spec.kind === "analysis") {
+    const workspace = spec.workspace || spec.cwd;
+    try {
+      if (!(await fs2.stat(workspace)).isDirectory()) throw new Error();
+    } catch {
+      throw new Error("Workspace no longer exists or is not accessible: " + workspace);
+    }
+    return workspace;
+  }
   const worktree = path2.join(dir, "worktree");
   await git(spec.repo, ["worktree", "add", "-b", "zcode-subagents/" + spec.id, worktree, spec.baseCommit]);
   return worktree;

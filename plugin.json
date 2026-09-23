@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "zcode-subagents",
-  "version": "0.2.0+codex.20260923095948",
+  "version": "0.2.0+codex.20260923101127",
   "description": "Call ZCode subagent tools directly in Codex, with desktop app-server model routing and a shared 12-task limit.",
   "author": {
     "name": "kyoubelyu"

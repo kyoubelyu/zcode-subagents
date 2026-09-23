@@ -166,6 +166,8 @@ Process cleanup runs on the supervisor's next scheduler tick once all tasks in t
 
 On the first upgrade from an adapter without process cleanup, queued tasks wait for existing workers to finish. The supervisor then replaces its own connection adapter and Host, using the same installed runtime files, before dispatching the queue. `zcode_doctor.resource_cleanup.adapter_update` reports this transition. Subsequent cleanup releases individual workspace processes and keeps the shared Host.
 
+Queued tasks and followups recheck their workspace before contacting the Host. If you removed that directory while the task waited, the task fails locally instead of asking the desktop runtime to spawn in a missing directory.
+
 Edit results include the worktree, branch, `changes.patch`, and `untrackedFiles`. Review both tracked and new files. No changes are automatically merged into your checkout. Remove worktrees only after retaining the changes you want.
 
 Analysis tasks enable ZCode's plan state and allow reading/search tools. Edit tasks additionally allow `Edit` and `Write`. Both can use todo tools; Bash, recursive delegation, workflows, and third-party MCP tools are outside the allowlist. Workers write tests and return commands for **Codex to run after review**. Unexpected interactive requests stop the task for review. These controls and worktrees are not an OS sandbox; execution uses your OS account and the installed ZCode runtime.

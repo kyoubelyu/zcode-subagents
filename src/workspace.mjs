@@ -21,7 +21,14 @@ export async function inspectWorkspace(cwd, kind) {
   return { cwd: real, repo: root, baseCommit: (await git(root, ['rev-parse', 'HEAD'])).trim() };
 }
 export async function prepareWorkspace(spec, dir) {
-  if (spec.workspace || spec.kind === 'analysis') return spec.workspace || spec.cwd;
+  if (spec.workspace || spec.kind === 'analysis') {
+    const workspace = spec.workspace || spec.cwd;
+    // Queued work can outlive a user's temporary checkout. The installed Host
+    // can crash on spawn ENOENT, so reject stale paths before contacting it.
+    try { if (!(await fs.stat(workspace)).isDirectory()) throw new Error(); }
+    catch { throw new Error('Workspace no longer exists or is not accessible: ' + workspace); }
+    return workspace;
+  }
   const worktree = path.join(dir, 'worktree');
   await git(spec.repo, ['worktree', 'add', '-b', 'zcode-subagents/' + spec.id, worktree, spec.baseCommit]);
   return worktree;

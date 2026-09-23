@@ -139,6 +139,23 @@ test('an old adapter drains active tasks before replacement and then dispatches 
   assert.equal(ctx.manager.resources.upgrade, undefined);
 });
 
+test('a workspace removed while queued fails before contacting the shared Host', async (t) => {
+  const ctx = await setup(t, 1);
+  const busy = await ctx.manager.spawn(input(ctx, 'occupy-slot', '[fixture:sleep=2000]'));
+  await until(async () => (await ctx.manager.status(busy.task_id)).status === 'running');
+  const before = await hostHealth(ctx.config);
+  const removed = path.join(ctx.home, 'temporary-checkout');
+  await fs.mkdir(removed);
+  const stale = await ctx.manager.spawn({ ...input(ctx, 'removed-queued-workspace'), cwd: removed });
+  await fs.rm(removed, { recursive: true });
+  const result = await done(ctx, stale.task_id);
+  assert.equal(result.status, 'failed');
+  assert.match(result.error, /Workspace no longer exists/);
+  assert.equal(result.appServer, undefined);
+  assert.equal((await done(ctx, busy.task_id)).status, 'succeeded');
+  assert.equal((await hostHealth(ctx.config)).hostPid, before.hostPid);
+});
+
 test('12 jobs execute, the 13th queues, cancellation releases a slot, request retries are idempotent', async (t) => {
   const ctx = await setup(t);
   const tasks = [];
