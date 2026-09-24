@@ -105,6 +105,20 @@ sessions and workflows can be watched together, and simultaneous waits can overl
 without consuming each other's results. Unknown IDs fail before waiting, even if
 another supplied task already ended. Responses identify completed and pending IDs.
 There is no wait_id, mode selection, duration override or early slice response.
-Timeout and caller disconnect never cancel task execution. Disconnect/cancellation
-aborts the corresponding HTTP poll so it does not leave a ten-minute timer behind.
-Both the internal wait transport and Codex's MCP tool timeout allow 660 seconds.
+The MCP adapter and command client ensure the supervisor is available, then
+observe the workers' atomically written task files directly. The shared
+task-state reader provides the same status and artifact shape as the supervisor.
+No long-lived supervisor HTTP connection is needed for a public wait. A
+supervisor replacement therefore cannot reset its monotonic deadline or drop
+it with `socket hang up`; an already-loaded client can keep waiting even after
+its old plugin cache is removed.
+
+Timeout and caller disconnect never cancel task execution. MCP cancellation
+aborts the client-side poll so it does not leave a ten-minute timer behind.
+Codex's MCP tool timeout allows 660 seconds. The private supervisor HTTP wait
+endpoint remains available for internal callers with the same timeout headroom.
+
+Acceptance: hold a wait open from a removed plugin cache while a new client
+replaces the supervisor; it must return the original task's result. Two MCP
+clients with overlapping watch lists must also survive supervisor replacement
+without another wait invocation or duplicate task submission.

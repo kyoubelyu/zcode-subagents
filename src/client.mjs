@@ -4,6 +4,8 @@ import { openSync, closeSync, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { settings, privateDir, delay, VERSION, readJson, sameProcess, WAIT_TRANSPORT_TIMEOUT } from './common.mjs';
+import { waitForTasks } from './wait.mjs';
+import { taskStatus } from './task-state.mjs';
 
 async function supervisorFilesExist(health) {
   let entry = health.entry;
@@ -89,5 +91,10 @@ export async function ensureDaemon(config = settings()) {
   throw new Error('Supervisor did not start. Inspect ' + path.join(config.home, 'supervisor.log'));
 }
 export async function call(method, params = {}, options) {
-  return request(await ensureDaemon(), method, params, false, options);
+  const config = await ensureDaemon();
+  // A supervisor upgrade closes its HTTP connections while detached workers
+  // continue. Keep the wait and its original deadline in this client, observing
+  // the same durable state as status(), so replacement cannot drop the wait.
+  if (method === 'zcode_wait') return waitForTasks((id) => taskStatus(config, id), params.task_ids, options);
+  return request(config, method, params, false, options);
 }

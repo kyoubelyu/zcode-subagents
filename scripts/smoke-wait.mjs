@@ -1,5 +1,6 @@
-// Real Codex -> installed plugin -> supervisor transport test, no model calls.
+// Real Codex -> installed plugin wait test, no model calls.
 // Takes ten minutes by default. --quick checks the >60-second completion path.
+// --restart-supervisor replaces the isolated supervisor during the same waits.
 import { promises as fs } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
@@ -66,6 +67,18 @@ try {
   });
   timers.push(setTimeout(() => { void finish(tasks[2]); }, 1000)); // Unlisted completion must not wake either wait.
   timers.push(setTimeout(() => { void finish(tasks[1]); }, 65000));
+  const restart = process.argv.includes('--restart-supervisor') ? (async () => {
+    await delay(2000);
+    const owner = await readJson(path.join(home, 'supervisor.lock/owner.json'));
+    assert.ok(await sameProcess(owner));
+    process.kill(owner.pid, 'SIGTERM');
+    for (let i = 0; i < 100 && await sameProcess(owner); i++) await delay(50);
+    assert.equal(await sameProcess(owner), false);
+    assert.equal((await call(threads[0], 'status', { task_id: tasks[0] })).status, 'running');
+    const replacement = await readJson(path.join(home, 'supervisor.lock/owner.json'));
+    assert.notEqual(replacement.pid, owner.pid);
+    console.log('SUPERVISOR_REPLACED_DURING_WAIT', JSON.stringify({ before: owner.pid, after: replacement.pid }));
+  })() : undefined;
   const [one, two, expired] = await Promise.all([
     call(threads[0], 'wait', { task_ids: [tasks[0], tasks[1]] }).then((value) => {
       console.log('ANY_COMPLETION', JSON.stringify({ elapsed_ms: value.elapsed_ms, ready: value.ready, completed: value.completed_task_ids, pending: value.pending_task_ids }));
@@ -77,6 +90,7 @@ try {
       console.log('TEN_MINUTE_TIMEOUT', JSON.stringify({ elapsed_ms: value.elapsed_ms, ready: value.ready, timed_out: value.timed_out }));
       return value;
     }),
+    restart,
   ]);
   assert.deepEqual(one.completed_task_ids, [tasks[1]]); assert.deepEqual(one.pending_task_ids, [tasks[0]]);
   assert.deepEqual(two.completed_task_ids, [tasks[1]]);

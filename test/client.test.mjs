@@ -79,15 +79,27 @@ test('a removed plugin cache replaces only the supervisor and preserves active t
     await stopHost(config); await delay(500); await fs.rm(home, { recursive: true, force: true });
   });
   const oldClient = path.join(oldRoot, 'control.mjs');
-  const first = await run(oldClient, 'spawn', { workflow_id: 'cache-test', request_key: 'running', cwd: home, prompt: '[fixture:sleep=2500]' });
+  const first = await run(oldClient, 'spawn', { workflow_id: 'cache-test', request_key: 'running', cwd: home, prompt: '[fixture:sleep=6000]' });
   let state;
   for (let i = 0; i < 80; i++) { state = await run(oldClient, 'status', { task_id: first.task_id }); if (state.status === 'running') break; await delay(100); }
   assert.equal(state.status, 'running');
   const before = await request(config, null, null, true), host = await hostHealth(config);
+  // Keep a call made from the old cache pending while another client replaces
+  // its supervisor. Losing that HTTP connection must not end the public wait.
+  let settled = false;
+  const waiting = run(oldClient, 'wait', { task_ids: [first.task_id] })
+    .then((value) => ({ value }), (error) => ({ error })).finally(() => { settled = true; });
+  await delay(300);
+  assert.equal(settled, false);
   await fs.rm(oldRoot, { recursive: true });
   const doctor = await run(client, 'doctor');
   assert.equal(doctor.appServer.instance, host.instance);
   assert.notEqual((await request(config, null, null, true)).pid, before.pid);
+  const keptWaiting = await waiting;
+  assert.ifError(keptWaiting.error);
+  assert.deepEqual(keptWaiting.value.completed_task_ids, [first.task_id]);
+  assert.equal(keptWaiting.value.tasks[0].status, 'succeeded');
+  assert.ok(keptWaiting.value.elapsed_ms >= 3000, JSON.stringify(keptWaiting.value));
   const second = await run(client, 'spawn', { workflow_id: 'cache-test', request_key: 'new', cwd: home, prompt: 'continue' });
   const result = await run(client, 'wait', { task_ids: [first.task_id, second.task_id] });
   assert.equal(result.ready, true);

@@ -12,7 +12,7 @@ import { promises as fs3 } from "node:fs";
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { openSync, closeSync, promises as fs2 } from "node:fs";
-import path2 from "node:path";
+import path3 from "node:path";
 import { fileURLToPath } from "node:url";
 
 // src/common.mjs
@@ -20,7 +20,9 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 var VERSION = "0.2.0";
+var TERMINAL = /* @__PURE__ */ new Set(["succeeded", "failed", "cancelled", "interrupted"]);
 var MAX_CONCURRENCY = 12;
+var WAIT_TIMEOUT = 6e5;
 var WAIT_TRANSPORT_TIMEOUT = 66e4;
 function settings(env = process.env) {
   const home = path.resolve(env.ZCODE_SUBAGENTS_HOME || path.join(os.homedir(), ".local/share/zcode-subagents"));
@@ -39,6 +41,11 @@ function settings(env = process.env) {
   };
 }
 var delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+function validId(id2) {
+  if (typeof id2 !== "string" || !/^[a-f0-9-]{36}$/.test(id2)) throw new Error("Invalid task ID.");
+  return id2;
+}
+var taskDir = (config2, id2) => path.join(config2.home, "tasks", validId(id2));
 async function privateDir(dir) {
   await fs.mkdir(dir, { recursive: true, mode: 448 });
   await fs.chmod(dir, 448);
@@ -66,6 +73,67 @@ async function sameProcess(owner) {
   return Boolean(owner?.pid && owner?.identity && await processIdentity(owner.pid) === owner.identity);
 }
 
+// src/wait.mjs
+import { setTimeout as sleep } from "node:timers/promises";
+var realtime = {
+  now: () => performance.now(),
+  wall: () => Date.now(),
+  sleep: (ms, signal) => sleep(ms, void 0, { signal })
+};
+async function waitForTasks(readStatus, taskIds, { signal, clock = realtime } = {}) {
+  if (!Array.isArray(taskIds) || !taskIds.length) throw new Error("A non-empty task_ids list is required.");
+  const ids = [...new Set(taskIds)];
+  const started = clock.now();
+  const deadline = new Date(clock.wall() + WAIT_TIMEOUT).toISOString();
+  for (; ; ) {
+    signal?.throwIfAborted();
+    const tasks = await Promise.all(ids.map(readStatus));
+    const completed = tasks.filter((task) => TERMINAL.has(task.status)).map((task) => task.task_id);
+    const pending = tasks.filter((task) => !TERMINAL.has(task.status)).map((task) => task.task_id);
+    const elapsed = Math.max(0, clock.now() - started);
+    if (completed.length || elapsed >= WAIT_TIMEOUT) return {
+      task_ids: ids,
+      completed_task_ids: completed,
+      pending_task_ids: pending,
+      ready: completed.length > 0,
+      timed_out: completed.length === 0,
+      timeout_ms: WAIT_TIMEOUT,
+      elapsed_ms: Math.floor(elapsed),
+      deadline,
+      tasks,
+      instruction: pending.length ? "Tasks continue independently. To wait again, pass only pending_task_ids as task_ids." : "All selected tasks ended. Inspect their results."
+    };
+    await clock.sleep(Math.min(200, WAIT_TIMEOUT - elapsed), signal);
+  }
+}
+
+// src/task-state.mjs
+import path2 from "node:path";
+async function readTask(config2, id2) {
+  const dir = taskDir(config2, id2);
+  const spec = await readJson(path2.join(dir, "spec.json"));
+  if (!spec) throw new Error("Task not found: " + id2);
+  const state = await readJson(path2.join(dir, "runtime.json"), { status: "queued" });
+  return { spec, state, dir };
+}
+async function taskStatus(config2, id2) {
+  const { spec, state, dir } = await readTask(config2, id2);
+  return {
+    task_id: id2,
+    workflow_id: spec.workflowId,
+    kind: spec.kind,
+    parent_task_id: spec.parentTaskId,
+    created_at: spec.createdAt,
+    ...state,
+    artifacts: {
+      directory: dir,
+      worker: path2.join(dir, "worker.log"),
+      ...state.backend === "desktop-app-server" ? { progress: path2.join(dir, "progress.jsonl") } : { stdout: path2.join(dir, "stdout.log"), stderr: path2.join(dir, "stderr.log") },
+      result: path2.join(dir, "result.json")
+    }
+  };
+}
+
 // src/client.mjs
 async function supervisorFilesExist(health) {
   let entry = health.entry;
@@ -76,10 +144,10 @@ async function supervisorFilesExist(health) {
       return false;
     }
   }
-  if (!entry || path2.basename(entry) !== "daemon.mjs") throw new Error("Cannot verify the existing supervisor entry path.");
+  if (!entry || path3.basename(entry) !== "daemon.mjs") throw new Error("Cannot verify the existing supervisor entry path.");
   try {
     await fs2.access(entry);
-    await fs2.access(path2.join(path2.dirname(entry), "worker.mjs"));
+    await fs2.access(path3.join(path3.dirname(entry), "worker.mjs"));
     return true;
   } catch (error62) {
     if (error62.code === "ENOENT") return false;
@@ -137,7 +205,7 @@ async function ensureDaemon(config2 = settings()) {
     } catch {
       throw new Error("This plugin cache was removed. Reconnect using the updated installed plugin. Existing tasks are retained.");
     }
-    const owner = await readJson(path2.join(config2.home, "supervisor.lock/owner.json"));
+    const owner = await readJson(path3.join(config2.home, "supervisor.lock/owner.json"));
     if (owner?.pid !== health.pid) throw new Error("Supervisor changed during cache recovery; query again.");
     if (await sameProcess(owner)) {
       try {
@@ -150,13 +218,13 @@ async function ensureDaemon(config2 = settings()) {
     if (await sameProcess(owner)) throw new Error("Old plugin supervisor is still stopping. Existing work is retained; query again shortly.");
   }
   await privateDir(config2.home);
-  const log = openSync(path2.join(config2.home, "supervisor.log"), "a", 384);
+  const log = openSync(path3.join(config2.home, "supervisor.log"), "a", 384);
   try {
     const daemon = spawn("flock", [
       "--exclusive",
       "--nonblock",
       "--close",
-      path2.join(config2.home, "supervisor.flock"),
+      path3.join(config2.home, "supervisor.flock"),
       process.execPath,
       fileURLToPath(new URL("./daemon.mjs", import.meta.url))
     ], {
@@ -187,10 +255,12 @@ async function ensureDaemon(config2 = settings()) {
     } catch {
     }
   }
-  throw new Error("Supervisor did not start. Inspect " + path2.join(config2.home, "supervisor.log"));
+  throw new Error("Supervisor did not start. Inspect " + path3.join(config2.home, "supervisor.log"));
 }
 async function call(method, params = {}, options) {
-  return request(await ensureDaemon(), method, params, false, options);
+  const config2 = await ensureDaemon();
+  if (method === "zcode_wait") return waitForTasks((id2) => taskStatus(config2, id2), params.task_ids, options);
+  return request(config2, method, params, false, options);
 }
 
 // node_modules/zod/v4/classic/external.js
@@ -1009,10 +1079,10 @@ function mergeDefs(...defs) {
 function cloneDef(schema) {
   return mergeDefs(schema._zod.def);
 }
-function getElementAtPath(obj, path3) {
-  if (!path3)
+function getElementAtPath(obj, path4) {
+  if (!path4)
     return obj;
-  return path3.reduce((acc, key) => acc?.[key], obj);
+  return path4.reduce((acc, key) => acc?.[key], obj);
 }
 function promiseAllObject(promisesObj) {
   const keys = Object.keys(promisesObj);
@@ -1352,11 +1422,11 @@ function explicitlyAborted(x, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path3, issues) {
+function prefixIssues(path4, issues) {
   return issues.map((iss) => {
     var _a3;
     (_a3 = iss).path ?? (_a3.path = []);
-    iss.path.unshift(path3);
+    iss.path.unshift(path4);
     return iss;
   });
 }
@@ -1806,16 +1876,16 @@ function flattenError(error62, mapper = (issue2) => issue2.message) {
 }
 function formatError(error62, mapper = (issue2) => issue2.message) {
   const fieldErrors = { _errors: [] };
-  const processError = (error63, path3 = []) => {
+  const processError = (error63, path4 = []) => {
     for (const issue2 of error63.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
-        issue2.errors.map((issues) => processError({ issues }, [...path3, ...issue2.path]));
+        issue2.errors.map((issues) => processError({ issues }, [...path4, ...issue2.path]));
       } else if (issue2.code === "invalid_key") {
-        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path4, ...issue2.path]);
       } else if (issue2.code === "invalid_element") {
-        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path4, ...issue2.path]);
       } else {
-        const fullpath = [...path3, ...issue2.path];
+        const fullpath = [...path4, ...issue2.path];
         if (fullpath.length === 0) {
           fieldErrors._errors.push(mapper(issue2));
         } else {
@@ -1854,17 +1924,17 @@ function formatError(error62, mapper = (issue2) => issue2.message) {
 }
 function treeifyError(error62, mapper = (issue2) => issue2.message) {
   const result = { errors: [] };
-  const processError = (error63, path3 = []) => {
+  const processError = (error63, path4 = []) => {
     var _a3;
     for (const issue2 of error63.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
-        issue2.errors.map((issues) => processError({ issues }, [...path3, ...issue2.path]));
+        issue2.errors.map((issues) => processError({ issues }, [...path4, ...issue2.path]));
       } else if (issue2.code === "invalid_key") {
-        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path4, ...issue2.path]);
       } else if (issue2.code === "invalid_element") {
-        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path4, ...issue2.path]);
       } else {
-        const fullpath = [...path3, ...issue2.path];
+        const fullpath = [...path4, ...issue2.path];
         if (fullpath.length === 0) {
           result.errors.push(mapper(issue2));
           continue;
@@ -1903,8 +1973,8 @@ function treeifyError(error62, mapper = (issue2) => issue2.message) {
 }
 function toDotPath(_path) {
   const segs = [];
-  const path3 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
-  for (const seg of path3) {
+  const path4 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
+  for (const seg of path4) {
     if (typeof seg === "number")
       segs.push(`[${seg}]`);
     else if (typeof seg === "symbol")
@@ -19006,13 +19076,13 @@ function resolveRef(ref, ctx) {
   if (!ref.startsWith("#")) {
     throw new Error("External $ref is not supported, only local refs (#/...) are allowed");
   }
-  const path3 = ref.slice(1).split("/").filter(Boolean);
-  if (path3.length === 0) {
+  const path4 = ref.slice(1).split("/").filter(Boolean);
+  if (path4.length === 0) {
     return ctx.rootSchema;
   }
   const defsKey = ctx.version === "draft-2020-12" ? "$defs" : "definitions";
-  if (path3[0] === defsKey) {
-    const key = path3[1] === void 0 ? void 0 : decodeJSONPointerSegment(path3[1]);
+  if (path4[0] === defsKey) {
+    const key = path4[1] === void 0 ? void 0 : decodeJSONPointerSegment(path4[1]);
     if (!key || !ctx.defs[key]) {
       throw new Error(`Reference not found: ${ref}`);
     }

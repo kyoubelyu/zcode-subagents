@@ -9,6 +9,7 @@ import { hostCall } from './host-client.mjs';
 import { runningConversation } from './conversation.mjs';
 import { ResourceReaper, activeTask, workspaceFor } from './resources.mjs';
 import { waitForTasks } from './wait.mjs';
+import { readTask, taskStatus } from './task-state.mjs';
 
 const workerPath = fileURLToPath(new URL('./worker.mjs', import.meta.url));
 const active = activeTask;
@@ -39,21 +40,10 @@ export class Supervisor {
     return (await fs.readdir(path.join(this.config.home, 'tasks'))).filter((id) => /^[a-f0-9-]{36}$/.test(id));
   }
   async task(id) {
-    const dir = taskDir(this.config, id);
-    const spec = await readJson(path.join(dir, 'spec.json'));
-    if (!spec) throw new Error('Task not found: ' + id);
-    const state = await readJson(path.join(dir, 'runtime.json'), { status: 'queued' });
-    return { spec, state, dir };
+    return readTask(this.config, id);
   }
   async status(id) {
-    const { spec, state, dir } = await this.task(id);
-    return {
-      task_id: id, workflow_id: spec.workflowId, kind: spec.kind, parent_task_id: spec.parentTaskId,
-      created_at: spec.createdAt, ...state,
-      artifacts: { directory: dir, worker: path.join(dir, 'worker.log'),
-        ...(state.backend === 'desktop-app-server' ? { progress: path.join(dir, 'progress.jsonl') } :
-          { stdout: path.join(dir, 'stdout.log'), stderr: path.join(dir, 'stderr.log') }), result: path.join(dir, 'result.json') },
-    };
+    return taskStatus(this.config, id);
   }
   async list(workflowId) {
     const rows = [];

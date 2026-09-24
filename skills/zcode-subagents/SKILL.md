@@ -117,6 +117,9 @@ are rejected. Followups do not steer an active turn.
   At 10 minutes timed_out is true if none ended; tasks keep running. Cancelling
   or disconnecting the wait also leaves tasks running. run_timeout_ms separately
   limits execution; 0 leaves it unset. The plugin's MCP timeout is 660 seconds.
+  The client observes persisted task state, so replacing the supervisor leaves
+  the same wait and its original deadline intact. An MCP client disconnection
+  still requires reconnecting and waiting on the existing IDs.
 - succeeded means V4 reported the submitted turn completed with a response.
   Read the response, inspect changes.patch and untrackedFiles in the retained
   worktree, and run meaningful checks. Usage is session cumulative, including

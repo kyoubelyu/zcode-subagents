@@ -96,10 +96,18 @@ test('direct MCP tools preserve app-server tasks across disconnects, with models
   const third = await connect();
   const slow = await call(second, 'zcode_spawn', { workflow_id: 'session-a', request_key: 'slow', cwd: home, prompt: '[fixture:sleep=30000]' });
   const fast = await call(third, 'zcode_spawn', { workflow_id: 'session-b', request_key: 'fast', cwd: home, prompt: '[fixture:sleep=1200]' });
-  const [one, two] = await Promise.all([
+  const waiting = Promise.all([
     call(second, 'zcode_wait', { task_ids: [slow.task_id, fast.task_id] }),
     call(third, 'zcode_wait', { task_ids: [fast.task_id] }),
   ]);
+  await delay(300);
+  const owner = await readJson(path.join(home, 'supervisor.lock/owner.json'));
+  process.kill(owner.pid, 'SIGTERM');
+  for (let i = 0; i < 80 && await sameProcess(owner); i++) await delay(50);
+  assert.equal(await sameProcess(owner), false);
+  await call(second, 'zcode_status', { task_id: slow.task_id });
+  assert.notEqual((await request(config, null, null, true)).pid, owner.pid);
+  const [one, two] = await waiting;
   assert.deepEqual(one.completed_task_ids, [fast.task_id]);
   assert.deepEqual(one.pending_task_ids, [slow.task_id]);
   assert.deepEqual(two.completed_task_ids, [fast.task_id]);

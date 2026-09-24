@@ -200,6 +200,13 @@ At ten minutes, a still-pending wait returns `ready: false, timed_out: true`. Th
 
 The plugin's MCP declaration allows 660 seconds per call, leaving transport headroom for the 600-second wait. Custom MCP clients must also allow at least 660 seconds (for the TypeScript SDK, pass `{ timeout: 660000 }` in request options). Disconnecting or cancelling a wait releases that request's timer without cancelling its tasks.
 
+After ensuring the supervisor is available, the MCP adapter or command client
+waits by reading the workers' persisted task state. It keeps the original
+deadline locally, so replacing the supervisor during a plugin update does not
+break an in-flight wait with `socket hang up` or restart its ten-minute timer.
+If the MCP client itself disconnects, reconnect and wait on the existing task
+IDs; the task results remain available.
+
 The plugin uses V4 commands and authoritative conversation snapshots. `succeeded` means it observed the submitted turn finish successfully with an assistant response. It does not mean the generated code is correct or its suggested tests ran. Usage is the session's cumulative usage, including earlier followup turns.
 
 After a worker crash, the supervisor stops that session before releasing its slot. If it cannot confirm that work stopped, `cleanup_pending` keeps the slot occupied. A Host or workspace app-server replacement fails the affected task without resubmitting it. Review failed/interrupted artifacts before explicitly retrying.
@@ -255,5 +262,8 @@ opens two ephemeral Codex threads, checks that a 65-second task completion wakes
 both selected waits, and lets a separate call reach the full ten-minute timeout.
 It sends no model prompts and consumes no model quota. `--quick` skips the
 ten-minute case. The isolated data and diagnostic log are retained under `/tmp`.
+Add `--restart-supervisor` to replace that isolated supervisor while both waits
+are pending and verify that the same calls still complete. For the shorter
+check, use `node scripts/smoke-wait.mjs --quick --restart-supervisor`.
 
 This package uses `.codex-plugin/plugin.json` and `.mcp.json`. The Codex MCP manifest carries `tool_timeout_sec: 660`. A portable root manifest would take precedence in current Codex while its MCP loader drops this timeout setting, so this package intentionally uses the supported Codex compatibility format.
