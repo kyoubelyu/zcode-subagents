@@ -21,6 +21,7 @@ import os from "node:os";
 import path from "node:path";
 var VERSION = "0.2.0";
 var MAX_CONCURRENCY = 12;
+var WAIT_TRANSPORT_TIMEOUT = 66e4;
 function settings(env = process.env) {
   const home = path.resolve(env.ZCODE_SUBAGENTS_HOME || path.join(os.homedir(), ".local/share/zcode-subagents"));
   const concurrency = Number(env.ZCODE_SUBAGENTS_CONCURRENCY || MAX_CONCURRENCY);
@@ -85,13 +86,14 @@ async function supervisorFilesExist(health) {
     throw error62;
   }
 }
-function request(config2, method, params, health = false) {
+function request(config2, method, params, health = false, { signal } = {}) {
   return new Promise((resolve, reject) => {
     const req = http.request({
       socketPath: config2.socket,
       path: health ? "/health" : "/rpc",
       method: health ? "GET" : "POST",
-      headers: { "Content-Type": "application/json" }
+      headers: { "Content-Type": "application/json" },
+      signal
     }, (res) => {
       let body = "";
       res.setEncoding("utf8");
@@ -110,7 +112,10 @@ function request(config2, method, params, health = false) {
         }
       });
     });
-    req.setTimeout(55e3, () => req.destroy(new Error("Supervisor request timed out. Query task status before retrying a mutation.")));
+    req.setTimeout(
+      method === "zcode_wait" ? WAIT_TRANSPORT_TIMEOUT : 55e3,
+      () => req.destroy(new Error("Supervisor request timed out. Query task status before retrying a mutation."))
+    );
     req.on("error", reject);
     req.end(health ? void 0 : JSON.stringify({ method, params }));
   });
@@ -184,8 +189,8 @@ async function ensureDaemon(config2 = settings()) {
   }
   throw new Error("Supervisor did not start. Inspect " + path2.join(config2.home, "supervisor.log"));
 }
-async function call(method, params = {}) {
-  return request(await ensureDaemon(), method, params);
+async function call(method, params = {}, options) {
+  return request(await ensureDaemon(), method, params, false, options);
 }
 
 // node_modules/zod/v4/classic/external.js
@@ -19888,10 +19893,7 @@ var schemas = {
     limit: external_exports.number().int().min(1).max(100).default(25)
   }).strict(),
   zcode_wait: external_exports.object({
-    task_ids: external_exports.array(id).min(1).max(100).optional(),
-    wait_id: id.optional(),
-    mode: external_exports.enum(["any", "all"]).default("all"),
-    timeout_ms: external_exports.number().int().min(6e5).max(18e5).default(9e5)
+    task_ids: external_exports.array(id).min(1).max(100).describe("Required task IDs to watch. Wait up to 10 minutes in this call; return when any listed task reaches a terminal state. Only these tasks can wake this wait.")
   }).strict(),
   zcode_doctor: external_exports.object({}).strict(),
   zcode_models: external_exports.object({}).strict()
@@ -19901,7 +19903,6 @@ function validate2(method, params) {
   if (!schema) throw new Error("Unknown tool: " + method);
   const input2 = schema.parse(params || {});
   if (method === "zcode_spawn" && !input2.cwd.startsWith("/")) throw new Error("cwd must be an absolute path.");
-  if (method === "zcode_wait" && !input2.wait_id && !input2.task_ids) throw new Error("Supply task_ids or a wait_id.");
   return input2;
 }
 

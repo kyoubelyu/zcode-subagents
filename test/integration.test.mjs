@@ -220,19 +220,8 @@ test('cancel stops only its session; another task and the shared Host survive', 
   assert.equal((await hostHealth(ctx.config)).hostPid, before.hostPid);
 });
 
-test('wait deadlines survive slices, do not stop tasks, and runtime deadlines are separate', async (t) => {
+test('execution deadlines still stop tasks independently of waiting', async (t) => {
   const ctx = await setup(t);
-  const task = await ctx.manager.spawn(input(ctx, 'wait', '[fixture:sleep=10000]'));
-  const first = await ctx.manager.wait({ task_ids: [task.task_id] }, 10);
-  assert.equal(first.ready, false);
-  assert.equal(first.timed_out, false);
-  const second = await ctx.manager.wait({ wait_id: first.wait_id }, 10);
-  assert.equal(second.deadline, first.deadline);
-  await atomicJson(path.join(ctx.home, 'waits', first.wait_id + '.json'), {
-    ids: [task.task_id], mode: 'all', deadline: Date.now() - 1,
-  });
-  assert.equal((await ctx.manager.wait({ wait_id: first.wait_id }, 10)).timed_out, true);
-  assert.ok(!TERMINAL.has((await ctx.manager.status(task.task_id)).status));
   const timeout = await ctx.manager.spawn({ ...input(ctx, 'execution-timeout', '[fixture:sleep=10000]'), run_timeout_ms: 1000 });
   const result = await done(ctx, timeout.task_id);
   assert.equal(result.status, 'failed');

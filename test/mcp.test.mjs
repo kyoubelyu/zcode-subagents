@@ -22,7 +22,7 @@ test('direct MCP tools preserve app-server tasks across disconnects, with models
     const client = new Client({ name: 'zcode-mcp-test', version: '1.0.0' });
     clients.push(client);
     await client.connect(new StdioClientTransport({ command: process.execPath,
-      args: mcp.args.map((a) => a.replaceAll('${PLUGIN_ROOT}', pluginRoot)), env, stderr: 'pipe' }));
+      args: mcp.args, cwd: path.resolve(pluginRoot, mcp.cwd), env, stderr: 'pipe' }));
     return client;
   };
   const call = async (client, name, input = {}) => {
@@ -35,7 +35,8 @@ test('direct MCP tools preserve app-server tasks across disconnects, with models
   t.after(async () => {
     const list = await request(config, 'zcode_list', {}).catch(() => ({ tasks: [] }));
     for (const task of list.tasks) if (!TERMINAL.has(task.status)) await request(config, 'zcode_cancel', { task_id: task.task_id });
-    if (list.tasks.length) await request(config, 'zcode_wait', { task_ids: list.tasks.map((t) => t.task_id) });
+    let pending = list.tasks.filter((t) => !TERMINAL.has(t.status)).map((t) => t.task_id);
+    while (pending.length) pending = (await request(config, 'zcode_wait', { task_ids: pending })).pending_task_ids;
     await Promise.allSettled(clients.map((c) => c.close()));
     const owner = await readJson(path.join(home, 'supervisor.lock/owner.json'));
     if (await sameProcess(owner)) process.kill(owner.pid, 'SIGTERM');
@@ -46,6 +47,15 @@ test('direct MCP tools preserve app-server tasks across disconnects, with models
   assert.deepEqual(catalog.tools.map((t) => t.name).sort(),
     ['zcode_spawn', 'zcode_status', 'zcode_wait', 'zcode_followup', 'zcode_cancel', 'zcode_list', 'zcode_doctor', 'zcode_models'].sort());
   assert.ok(JSON.stringify(catalog.tools.find((t) => t.name === 'zcode_spawn').inputSchema.properties.model).includes('providerId'));
+  const waitSchema = catalog.tools.find((t) => t.name === 'zcode_wait').inputSchema;
+  assert.deepEqual(waitSchema.required, ['task_ids']);
+  assert.deepEqual(Object.keys(waitSchema.properties), ['task_ids']);
+  assert.equal(mcp.tool_timeout_sec, 660);
+  for (const args of [{}, { task_ids: [] }, { task_ids: ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'], mode: 'all' }]) {
+    const invalidWait = await first.callTool({ name: 'zcode_wait', arguments: args });
+    assert.equal(invalidWait.isError, true);
+    if (args.mode) assert.match(invalidWait.content[0].text, /[Uu]nrecognized/);
+  }
   const doctor = await call(first, 'zcode_doctor');
   assert.equal(doctor.backend, 'desktop-app-server'); assert.equal(doctor.concurrency, 12);
   assert.equal((await call(first, 'zcode_models')).defaultModel.modelId, 'default');
@@ -83,4 +93,15 @@ test('direct MCP tools preserve app-server tasks across disconnects, with models
   assert.equal((await call(second, 'zcode_wait', { task_ids: [long.task_id] })).tasks[0].status, 'cancelled');
   assert.equal((await call(second, 'zcode_list', { workflow_id: 'mcp-test' })).total, 3);
   assert.equal((await call(second, 'zcode_doctor')).appServer.instance, doctor.appServer.instance);
+  const third = await connect();
+  const slow = await call(second, 'zcode_spawn', { workflow_id: 'session-a', request_key: 'slow', cwd: home, prompt: '[fixture:sleep=30000]' });
+  const fast = await call(third, 'zcode_spawn', { workflow_id: 'session-b', request_key: 'fast', cwd: home, prompt: '[fixture:sleep=1200]' });
+  const [one, two] = await Promise.all([
+    call(second, 'zcode_wait', { task_ids: [slow.task_id, fast.task_id] }),
+    call(third, 'zcode_wait', { task_ids: [fast.task_id] }),
+  ]);
+  assert.deepEqual(one.completed_task_ids, [fast.task_id]);
+  assert.deepEqual(one.pending_task_ids, [slow.task_id]);
+  assert.deepEqual(two.completed_task_ids, [fast.task_id]);
+  assert.equal((await call(second, 'zcode_status', { task_id: slow.task_id })).status, 'running');
 });

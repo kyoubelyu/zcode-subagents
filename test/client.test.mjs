@@ -90,5 +90,7 @@ test('a removed plugin cache replaces only the supervisor and preserves active t
   assert.notEqual((await request(config, null, null, true)).pid, before.pid);
   const second = await run(client, 'spawn', { workflow_id: 'cache-test', request_key: 'new', cwd: home, prompt: 'continue' });
   const result = await run(client, 'wait', { task_ids: [first.task_id, second.task_id] });
-  assert.ok(result.tasks.every((task) => task.status === 'succeeded'), JSON.stringify(result));
+  assert.equal(result.ready, true);
+  const remaining = result.pending_task_ids.length ? await run(client, 'wait', { task_ids: result.pending_task_ids }) : result;
+  assert.ok(remaining.tasks.every((task) => task.status === 'succeeded'), JSON.stringify(remaining));
 });

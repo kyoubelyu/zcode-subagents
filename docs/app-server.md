@@ -95,3 +95,16 @@ active workers, retains queued tasks, verifies the owned adapter's process
 identity, closes it gracefully, and starts the updated plugin adapter using the
 same desktop files. Runtime executables and account configuration are untouched.
 Doctor reports a pending/draining adapter update. Healthy capable Hosts are reused.
+
+## Blocking wait contract
+
+Each zcode_wait requires an explicit non-empty list of task_ids and independently
+waits up to 600,000 milliseconds for any listed task to become terminal. It uses
+a monotonic clock; wall-clock changes do not extend or shorten the wait. Different
+sessions and workflows can be watched together, and simultaneous waits can overlap
+without consuming each other's results. Unknown IDs fail before waiting, even if
+another supplied task already ended. Responses identify completed and pending IDs.
+There is no wait_id, mode selection, duration override or early slice response.
+Timeout and caller disconnect never cancel task execution. Disconnect/cancellation
+aborts the corresponding HTTP poll so it does not leave a ten-minute timer behind.
+Both the internal wait transport and Codex's MCP tool timeout allow 660 seconds.

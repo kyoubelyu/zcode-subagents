@@ -97,12 +97,16 @@ are rejected. Followups do not steer an active turn.
   then run checks from Codex. Do not promise worker shell execution.
 - zcode_spawn returns a task_id immediately. Continue independent local work.
   zcode_status/zcode_cancel take `{"task_id":"<id>"}`. zcode_list accepts optional workflow_id.
-- Call zcode_wait with `{"task_ids":["<id>"],"mode":"all"}` (or mode any).
-  Each call returns after at most 20 seconds. Repeat with
-  `{"wait_id":"<returned id>"}` until ready or timed_out. The logical timeout
-  defaults to 15 minutes and accepts timeout_ms from 600000 to 1800000. A wait
-  timeout never cancels work. run_timeout_ms separately limits execution;
-  0 leaves it unset.
+- Call zcode_wait with `{"task_ids":["<id-a>","<id-b>"]}`. A non-empty list
+  of task IDs is mandatory. One call blocks for up to 10 minutes and returns
+  when ANY listed task ends, including failure, cancellation or interruption.
+  IDs may span sessions/workflows; only those IDs can wake the wait. Each caller
+  has an independent watch list and deadline. Already-ended tasks return immediately.
+  Inspect completed_task_ids and the corresponding statuses. To wait again,
+  pass only pending_task_ids as task_ids. Never send wait_id, mode or timeout_ms.
+  At 10 minutes timed_out is true if none ended; tasks keep running. Cancelling
+  or disconnecting the wait also leaves tasks running. run_timeout_ms separately
+  limits execution; 0 leaves it unset. The plugin's MCP timeout is 660 seconds.
 - succeeded means V4 reported the submitted turn completed with a response.
   Read the response, inspect changes.patch and untrackedFiles in the retained
   worktree, and run meaningful checks. Usage is session cumulative, including

@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { WAIT_TRANSPORT_TIMEOUT } from '../src/common.mjs';
 
 const execute = promisify(execFile);
 const root = fileURLToPath(new URL('../', import.meta.url));
@@ -18,7 +19,8 @@ const client = new Client({ name: 'zcode-live-smoke', version: '0.2.0' });
 await client.connect(new StdioClientTransport({ command: process.execPath, args: [server], stderr: 'inherit' }));
 const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-live-'));
 const command = async (name, input = {}) => {
-  const result = await client.callTool({ name: 'zcode_' + name, arguments: input });
+  const result = await client.callTool({ name: 'zcode_' + name, arguments: input }, undefined,
+    { timeout: WAIT_TRANSPORT_TIMEOUT });
   if (result.isError) throw new Error(result.content[0].text);
   return result.structuredContent || JSON.parse(result.content[0].text);
 };
@@ -27,11 +29,8 @@ const tasks = [];
 const finish = async (task) => {
   tasks.push(task.task_id);
   console.log('Task:', task.task_id);
-  let wait;
-  do {
-    wait = await command('wait', wait ? { wait_id: wait.wait_id } : { task_ids: [task.task_id] });
-    console.log('Progress:', wait.tasks.map((t) => t.status).join(', '));
-  } while (!wait.ready && !wait.timed_out);
+  const wait = await command('wait', { task_ids: [task.task_id] });
+  console.log('Progress:', wait.tasks.map((t) => t.status).join(', '));
   let result = await command('status', { task_id: task.task_id });
   console.log(JSON.stringify({ task_id: result.task_id, status: result.status, response: result.response,
     error: result.error, effectiveModel: result.effectiveModel, sessionId: result.sessionId, workspace: result.workspace }));

@@ -36506,10 +36506,7 @@ var schemas = {
     limit: external_exports.number().int().min(1).max(100).default(25)
   }).strict(),
   zcode_wait: external_exports.object({
-    task_ids: external_exports.array(id).min(1).max(100).optional(),
-    wait_id: id.optional(),
-    mode: external_exports.enum(["any", "all"]).default("all"),
-    timeout_ms: external_exports.number().int().min(6e5).max(18e5).default(9e5)
+    task_ids: external_exports.array(id).min(1).max(100).describe("Required task IDs to watch. Wait up to 10 minutes in this call; return when any listed task reaches a terminal state. Only these tasks can wake this wait.")
   }).strict(),
   zcode_doctor: external_exports.object({}).strict(),
   zcode_models: external_exports.object({}).strict()
@@ -36528,6 +36525,7 @@ import os from "node:os";
 import path from "node:path";
 var VERSION = "0.2.0";
 var MAX_CONCURRENCY = 12;
+var WAIT_TRANSPORT_TIMEOUT = 66e4;
 function settings(env = process.env) {
   const home = path.resolve(env.ZCODE_SUBAGENTS_HOME || path.join(os.homedir(), ".local/share/zcode-subagents"));
   const concurrency = Number(env.ZCODE_SUBAGENTS_CONCURRENCY || MAX_CONCURRENCY);
@@ -36592,13 +36590,14 @@ async function supervisorFilesExist(health) {
     throw error62;
   }
 }
-function request(config2, method, params, health = false) {
+function request(config2, method, params, health = false, { signal } = {}) {
   return new Promise((resolve, reject) => {
     const req = http.request({
       socketPath: config2.socket,
       path: health ? "/health" : "/rpc",
       method: health ? "GET" : "POST",
-      headers: { "Content-Type": "application/json" }
+      headers: { "Content-Type": "application/json" },
+      signal
     }, (res) => {
       let body = "";
       res.setEncoding("utf8");
@@ -36617,7 +36616,10 @@ function request(config2, method, params, health = false) {
         }
       });
     });
-    req.setTimeout(55e3, () => req.destroy(new Error("Supervisor request timed out. Query task status before retrying a mutation.")));
+    req.setTimeout(
+      method === "zcode_wait" ? WAIT_TRANSPORT_TIMEOUT : 55e3,
+      () => req.destroy(new Error("Supervisor request timed out. Query task status before retrying a mutation."))
+    );
     req.on("error", reject);
     req.end(health ? void 0 : JSON.stringify({ method, params }));
   });
@@ -36691,15 +36693,15 @@ async function ensureDaemon(config2 = settings()) {
   }
   throw new Error("Supervisor did not start. Inspect " + path2.join(config2.home, "supervisor.log"));
 }
-async function call(method, params = {}) {
-  return request(await ensureDaemon(), method, params);
+async function call(method, params = {}, options) {
+  return request(await ensureDaemon(), method, params, false, options);
 }
 
 // src/server.mjs
 var descriptions = {
   zcode_spawn: 'Delegate a bounded task to the installed ZCode Desktop app-server. Returns a task ID immediately; at most 12 tasks run across clients. Edit tasks use isolated Git worktrees. Omit model or pass "default" for the configured default; pass a provider/model object to override it. Reuse identical workflow_id/request_key requests after a lost reply.',
   zcode_status: "Read task progress, effective and observed models, response, session usage, worktree, diff and artifact paths. Verify generated code and tests before integrating it.",
-  zcode_wait: "Wait for any/all tasks. Logical default 15 minutes, min 10, max 30. Each call returns after at most 20 seconds. Continue with wait_id to preserve the deadline. A wait timeout never cancels tasks.",
+  zcode_wait: "Wait in one call for up to 10 minutes until ANY explicitly listed task ends (succeeded, failed, cancelled or interrupted). Requires non-empty task_ids; supports multiple sessions and workflows. Returns completed_task_ids and pending_task_ids. Already-ended tasks return immediately. Timeout never cancels work. For another wait, pass only the pending task IDs.",
   zcode_followup: 'Continue the same app-server session and workspace after the parent finishes. Omitted model inherits the parent effective selection; "default" re-reads the current default; an object overrides it. Use the returned task ID for the next followup; sibling followups are rejected.',
   zcode_cancel: "Request cancellation of one queued or active task. Poll for a terminal state. Worktrees and logs are retained; the shared Host and other sessions keep running.",
   zcode_list: "List recent tasks, optionally filtered by workflow_id. Use after reconnecting and read full results with zcode_status.",
@@ -36710,16 +36712,16 @@ var server = new McpServer({ name: "zcode-subagents", version: VERSION });
 for (const [name, schema] of Object.entries(schemas)) {
   server.registerTool(name, {
     description: descriptions[name],
-    inputSchema: schema.shape,
+    inputSchema: schema,
     annotations: {
       readOnlyHint: ["zcode_status", "zcode_list", "zcode_doctor", "zcode_models"].includes(name),
       destructiveHint: false,
       idempotentHint: true,
       openWorldHint: ["zcode_spawn", "zcode_followup"].includes(name)
     }
-  }, async (input2) => {
+  }, async (input2, extra) => {
     try {
-      const result = await call(name, input2);
+      const result = await call(name, input2, { signal: extra.signal });
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], structuredContent: result };
     } catch (error62) {
       return { isError: true, content: [{ type: "text", text: error62.message }] };

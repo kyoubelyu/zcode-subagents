@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Supervisor } from './supervisor.mjs';
 import { validate } from './schemas.mjs';
-import { settings, VERSION, privateDir, atomicJson, processIdentity } from './common.mjs';
+import { settings, VERSION, privateDir, atomicJson, processIdentity, WAIT_TIMEOUT } from './common.mjs';
 import { desktopRuntime } from './desktop-runtime.mjs';
 import { ensureHost, hostCall } from './host-client.mjs';
 
@@ -23,6 +23,8 @@ export async function startDaemon(config = settings()) {
   const supervisor = new Supervisor(config);
   await supervisor.init();
   const server = http.createServer(async (req, res) => {
+    const waiting = new AbortController();
+    res.once('close', () => waiting.abort());
     res.setHeader('Content-Type', 'application/json');
     try {
       if (req.method === 'GET' && req.url === '/health') {
@@ -44,7 +46,7 @@ export async function startDaemon(config = settings()) {
         case 'zcode_followup': result = await supervisor.followup(input); break;
         case 'zcode_status': result = await supervisor.status(input.task_id); break;
         case 'zcode_cancel': result = await supervisor.cancel(input.task_id); break;
-        case 'zcode_wait': result = await supervisor.wait(input); break;
+        case 'zcode_wait': result = await supervisor.wait(input, { signal: waiting.signal }); break;
         case 'zcode_list': {
           const all = await supervisor.list(input.workflow_id);
           result = { total: all.length, tasks: all.slice(-input.limit).map((task) => ({
@@ -63,7 +65,7 @@ export async function startDaemon(config = settings()) {
           result = { version: VERSION, concurrency: config.concurrency, hard_limit: 12,
             backend: 'desktop-app-server', appServer, data_directory: config.home,
             resource_cleanup: { policy: 'release-idle-workspaces', adapter_update: supervisor.resources.upgrade },
-            wait: { default_ms: 900000, min_ms: 600000, max_ms: 1800000, slice_ms: 20000 } };
+            wait: { timeout_ms: WAIT_TIMEOUT, mode: 'any', task_ids_required: true, blocking: true } };
           break;
         }
         case 'zcode_models': await ensureHost(config); result = await hostCall(config, 'models'); break;

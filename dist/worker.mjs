@@ -11,6 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 var MAX_CONCURRENCY = 12;
+var WAIT_TRANSPORT_TIMEOUT = 66e4;
 function settings(env = process.env) {
   const home = path.resolve(env.ZCODE_SUBAGENTS_HOME || path.join(os.homedir(), ".local/share/zcode-subagents"));
   const concurrency = Number(env.ZCODE_SUBAGENTS_CONCURRENCY || MAX_CONCURRENCY);
@@ -30,7 +31,7 @@ function settings(env = process.env) {
 var delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 var now = () => (/* @__PURE__ */ new Date()).toISOString();
 function validId(id) {
-  if (typeof id !== "string" || !/^[a-f0-9-]{36}$/.test(id)) throw new Error("Invalid task or wait ID.");
+  if (typeof id !== "string" || !/^[a-f0-9-]{36}$/.test(id)) throw new Error("Invalid task ID.");
   return id;
 }
 var taskDir = (config, id) => path.join(config.home, "tasks", validId(id));
@@ -123,13 +124,14 @@ import { fileURLToPath } from "node:url";
 
 // src/client.mjs
 import http from "node:http";
-function request(config, method, params, health = false) {
+function request(config, method, params, health = false, { signal } = {}) {
   return new Promise((resolve, reject) => {
     const req = http.request({
       socketPath: config.socket,
       path: health ? "/health" : "/rpc",
       method: health ? "GET" : "POST",
-      headers: { "Content-Type": "application/json" }
+      headers: { "Content-Type": "application/json" },
+      signal
     }, (res) => {
       let body = "";
       res.setEncoding("utf8");
@@ -148,7 +150,10 @@ function request(config, method, params, health = false) {
         }
       });
     });
-    req.setTimeout(55e3, () => req.destroy(new Error("Supervisor request timed out. Query task status before retrying a mutation.")));
+    req.setTimeout(
+      method === "zcode_wait" ? WAIT_TRANSPORT_TIMEOUT : 55e3,
+      () => req.destroy(new Error("Supervisor request timed out. Query task status before retrying a mutation."))
+    );
     req.on("error", reject);
     req.end(health ? void 0 : JSON.stringify({ method, params }));
   });

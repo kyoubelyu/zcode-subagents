@@ -6,9 +6,8 @@ import { createHash, randomUUID } from 'node:crypto';
 export const VERSION = '0.2.0';
 export const TERMINAL = new Set(['succeeded', 'failed', 'cancelled', 'interrupted']);
 export const MAX_CONCURRENCY = 12;
-export const WAIT_DEFAULT = 900000;
-export const WAIT_MIN = 600000;
-export const WAIT_MAX = 1800000;
+export const WAIT_TIMEOUT = 600000;
+export const WAIT_TRANSPORT_TIMEOUT = 660000;
 
 export function settings(env = process.env) {
   const home = path.resolve(env.ZCODE_SUBAGENTS_HOME || path.join(os.homedir(), '.local/share/zcode-subagents'));
@@ -28,7 +27,7 @@ export const newId = () => randomUUID();
 export const now = () => new Date().toISOString();
 export const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 export function validId(id) {
-  if (typeof id !== 'string' || !/^[a-f0-9-]{36}$/.test(id)) throw new Error('Invalid task or wait ID.');
+  if (typeof id !== 'string' || !/^[a-f0-9-]{36}$/.test(id)) throw new Error('Invalid task ID.');
   return id;
 }
 export const taskDir = (config, id) => path.join(config.home, 'tasks', validId(id));

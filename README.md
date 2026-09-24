@@ -85,7 +85,7 @@ Use these tools directly from Codex; shell commands are not required for normal 
 | `zcode_spawn` | Queue a new task and return its ID |
 | `zcode_status` | Read a task's progress, response, usage and artifacts |
 | `zcode_list` | Find tasks, optionally by `workflow_id` |
-| `zcode_wait` | Wait for any/all tasks, preserving a logical deadline |
+| `zcode_wait` | Block up to 10 minutes until any explicitly listed task ends |
 | `zcode_followup` | Continue the same session; return a new task ID |
 | `zcode_cancel` | Stop one task and retain its artifacts |
 | `zcode_doctor` | Inspect runtime availability, pool and wait settings |
@@ -156,7 +156,17 @@ For a followup, pass `task_id`, a new `request_key`, and `prompt`; optionally pa
 
 ## Waiting, failures and review
 
-Waits default to **15 minutes**, accept **10–30 minutes**, and return after at most **20 seconds per tool call**. Repeat `zcode_wait` with its returned `wait_id` to retain the original deadline. A wait timeout leaves the task running. `run_timeout_ms` is a separate execution deadline; `0` leaves it unset.
+`zcode_wait` blocks in **one call for up to 10 minutes**, returning as soon as **any** listed task ends. A non-empty `task_ids` array is required (1–100 UUIDs). IDs can belong to different sessions and workflows in the shared pool. Unlisted tasks cannot wake the wait, and simultaneous callers do not consume each other's completion events.
+
+```json
+{"task_ids":["<task-a-uuid>","<task-b-uuid>"]}
+```
+
+The response includes `completed_task_ids`, `pending_task_ids`, and each selected task's status. Already-ended tasks return immediately. Ended means `succeeded`, `failed`, `cancelled`, or `interrupted`; inspect the status before treating a result as successful. To keep waiting for the remaining work, call again with only `pending_task_ids` as `task_ids`.
+
+At ten minutes, a still-pending wait returns `ready: false, timed_out: true`. The tasks continue running. `run_timeout_ms` is a separate execution deadline; `0` leaves it unset. There are no 20-second slices, `wait_id` continuations, configurable wait duration, or `mode` parameter. Those old arguments now fail validation. Reopen your Codex thread after upgrading to load the new tool schema.
+
+The plugin's MCP declaration allows 660 seconds per call, leaving transport headroom for the 600-second wait. Custom MCP clients must also allow at least 660 seconds (for the TypeScript SDK, pass `{ timeout: 660000 }` in request options). Disconnecting or cancelling a wait releases that request's timer without cancelling its tasks.
 
 The plugin uses V4 commands and authoritative conversation snapshots. `succeeded` means it observed the submitted turn finish successfully with an assistant response. It does not mean the generated code is correct or its suggested tests ran. Usage is the session's cumulative usage, including earlier followup turns.
 
@@ -206,3 +216,12 @@ node scripts/smoke.mjs
 It calls the MCP tools to check the default model, an explicit override, a real edit and Python tests, followup inheritance after the previous process exits, reset to `default`, Host reuse, and unchanged runtime-file hashes/default selection. It verifies every task's workspace process exits after completion. Set `ZCODE_SUBAGENTS_SMOKE_MODEL` to a JSON model object to choose its explicit override. Set `ZCODE_SUBAGENTS_SMOKE_SERVER` to test an installed `dist/server.mjs`. Its temporary fixture and task artifacts are retained for inspection.
 
 Commit rebuilt `dist/` with source changes. GitHub Actions checks tests and bundle consistency. Protocol implementation notes are in [docs/app-server.md](docs/app-server.md). The plugin is MIT licensed; bundled dependency notices are in [dist/THIRD-PARTY-NOTICES.txt](dist/THIRD-PARTY-NOTICES.txt).
+
+To verify long waits through the installed plugin and real Codex MCP client, run
+`node scripts/smoke-wait.mjs`. It creates an isolated set of task-state fixtures,
+opens two ephemeral Codex threads, checks that a 65-second task completion wakes
+both selected waits, and lets a separate call reach the full ten-minute timeout.
+It sends no model prompts and consumes no model quota. `--quick` skips the
+ten-minute case. The isolated data and diagnostic log are retained under `/tmp`.
+
+This package uses `.codex-plugin/plugin.json` and `.mcp.json`. The Codex MCP manifest carries `tool_timeout_sec: 660`. A portable root manifest would take precedence in current Codex while its MCP loader drops this timeout setting, so this package intentionally uses the supported Codex compatibility format.

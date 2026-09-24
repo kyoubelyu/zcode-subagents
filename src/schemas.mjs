@@ -27,10 +27,8 @@ export const schemas = {
     limit: z.number().int().min(1).max(100).default(25),
   }).strict(),
   zcode_wait: z.object({
-    task_ids: z.array(id).min(1).max(100).optional(),
-    wait_id: id.optional(),
-    mode: z.enum(['any', 'all']).default('all'),
-    timeout_ms: z.number().int().min(600000).max(1800000).default(900000),
+    task_ids: z.array(id).min(1).max(100)
+      .describe('Required task IDs to watch. Wait up to 10 minutes in this call; return when any listed task reaches a terminal state. Only these tasks can wake this wait.'),
   }).strict(),
   zcode_doctor: z.object({}).strict(),
   zcode_models: z.object({}).strict(),
@@ -40,6 +38,5 @@ export function validate(method, params) {
   if (!schema) throw new Error('Unknown tool: ' + method);
   const input = schema.parse(params || {});
   if (method === 'zcode_spawn' && !input.cwd.startsWith('/')) throw new Error('cwd must be an absolute path.');
-  if (method === 'zcode_wait' && !input.wait_id && !input.task_ids) throw new Error('Supply task_ids or a wait_id.');
   return input;
 }

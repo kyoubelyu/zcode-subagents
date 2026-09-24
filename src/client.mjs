@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { openSync, closeSync, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { settings, privateDir, delay, VERSION, readJson, sameProcess } from './common.mjs';
+import { settings, privateDir, delay, VERSION, readJson, sameProcess, WAIT_TRANSPORT_TIMEOUT } from './common.mjs';
 
 async function supervisorFilesExist(health) {
   let entry = health.entry;
@@ -17,11 +17,11 @@ async function supervisorFilesExist(health) {
   catch (error) { if (error.code === 'ENOENT') return false; throw error; }
 }
 
-export function request(config, method, params, health = false) {
+export function request(config, method, params, health = false, { signal } = {}) {
   return new Promise((resolve, reject) => {
     const req = http.request({
       socketPath: config.socket, path: health ? '/health' : '/rpc',
-      method: health ? 'GET' : 'POST', headers: { 'Content-Type': 'application/json' },
+      method: health ? 'GET' : 'POST', headers: { 'Content-Type': 'application/json' }, signal,
     }, (res) => {
       let body = '';
       res.setEncoding('utf8');
@@ -38,7 +38,8 @@ export function request(config, method, params, health = false) {
         } catch (error) { reject(error); }
       });
     });
-    req.setTimeout(55000, () => req.destroy(new Error('Supervisor request timed out. Query task status before retrying a mutation.')));
+    req.setTimeout(method === 'zcode_wait' ? WAIT_TRANSPORT_TIMEOUT : 55000,
+      () => req.destroy(new Error('Supervisor request timed out. Query task status before retrying a mutation.')));
     req.on('error', reject);
     req.end(health ? undefined : JSON.stringify({ method, params }));
   });
@@ -87,6 +88,6 @@ export async function ensureDaemon(config = settings()) {
   }
   throw new Error('Supervisor did not start. Inspect ' + path.join(config.home, 'supervisor.log'));
 }
-export async function call(method, params = {}) {
-  return request(await ensureDaemon(), method, params);
+export async function call(method, params = {}, options) {
+  return request(await ensureDaemon(), method, params, false, options);
 }

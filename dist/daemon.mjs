@@ -25,9 +25,8 @@ import { createHash, randomUUID } from "node:crypto";
 var VERSION = "0.2.0";
 var TERMINAL = /* @__PURE__ */ new Set(["succeeded", "failed", "cancelled", "interrupted"]);
 var MAX_CONCURRENCY = 12;
-var WAIT_DEFAULT = 9e5;
-var WAIT_MIN = 6e5;
-var WAIT_MAX = 18e5;
+var WAIT_TIMEOUT = 6e5;
+var WAIT_TRANSPORT_TIMEOUT = 66e4;
 function settings(env = process.env) {
   const home = path.resolve(env.ZCODE_SUBAGENTS_HOME || path.join(os.homedir(), ".local/share/zcode-subagents"));
   const concurrency = Number(env.ZCODE_SUBAGENTS_CONCURRENCY || MAX_CONCURRENCY);
@@ -49,7 +48,7 @@ var newId = () => randomUUID();
 var now = () => (/* @__PURE__ */ new Date()).toISOString();
 var digest = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 function validId(id2) {
-  if (typeof id2 !== "string" || !/^[a-f0-9-]{36}$/.test(id2)) throw new Error("Invalid task or wait ID.");
+  if (typeof id2 !== "string" || !/^[a-f0-9-]{36}$/.test(id2)) throw new Error("Invalid task ID.");
   return id2;
 }
 var taskDir = (config2, id2) => path.join(config2.home, "tasks", validId(id2));
@@ -123,13 +122,14 @@ import { fileURLToPath } from "node:url";
 
 // src/client.mjs
 import http from "node:http";
-function request(config2, method, params, health = false) {
+function request(config2, method, params, health = false, { signal } = {}) {
   return new Promise((resolve, reject) => {
     const req = http.request({
       socketPath: config2.socket,
       path: health ? "/health" : "/rpc",
       method: health ? "GET" : "POST",
-      headers: { "Content-Type": "application/json" }
+      headers: { "Content-Type": "application/json" },
+      signal
     }, (res) => {
       let body = "";
       res.setEncoding("utf8");
@@ -148,7 +148,10 @@ function request(config2, method, params, health = false) {
         }
       });
     });
-    req.setTimeout(55e3, () => req.destroy(new Error("Supervisor request timed out. Query task status before retrying a mutation.")));
+    req.setTimeout(
+      method === "zcode_wait" ? WAIT_TRANSPORT_TIMEOUT : 55e3,
+      () => req.destroy(new Error("Supervisor request timed out. Query task status before retrying a mutation."))
+    );
     req.on("error", reject);
     req.end(health ? void 0 : JSON.stringify({ method, params }));
   });
@@ -307,6 +310,40 @@ var ResourceReaper = class {
   }
 };
 
+// src/wait.mjs
+import { setTimeout as sleep } from "node:timers/promises";
+var realtime = {
+  now: () => performance.now(),
+  wall: () => Date.now(),
+  sleep: (ms, signal) => sleep(ms, void 0, { signal })
+};
+async function waitForTasks(readStatus, taskIds, { signal, clock = realtime } = {}) {
+  if (!Array.isArray(taskIds) || !taskIds.length) throw new Error("A non-empty task_ids list is required.");
+  const ids = [...new Set(taskIds)];
+  const started = clock.now();
+  const deadline = new Date(clock.wall() + WAIT_TIMEOUT).toISOString();
+  for (; ; ) {
+    signal?.throwIfAborted();
+    const tasks = await Promise.all(ids.map(readStatus));
+    const completed = tasks.filter((task) => TERMINAL.has(task.status)).map((task) => task.task_id);
+    const pending = tasks.filter((task) => !TERMINAL.has(task.status)).map((task) => task.task_id);
+    const elapsed = Math.max(0, clock.now() - started);
+    if (completed.length || elapsed >= WAIT_TIMEOUT) return {
+      task_ids: ids,
+      completed_task_ids: completed,
+      pending_task_ids: pending,
+      ready: completed.length > 0,
+      timed_out: completed.length === 0,
+      timeout_ms: WAIT_TIMEOUT,
+      elapsed_ms: Math.floor(elapsed),
+      deadline,
+      tasks,
+      instruction: pending.length ? "Tasks continue independently. To wait again, pass only pending_task_ids as task_ids." : "All selected tasks ended. Inspect their results."
+    };
+    await clock.sleep(Math.min(200, WAIT_TIMEOUT - elapsed), signal);
+  }
+}
+
 // src/supervisor.mjs
 var workerPath = fileURLToPath2(new URL("./worker.mjs", import.meta.url));
 var active = activeTask;
@@ -319,7 +356,6 @@ var Supervisor = class {
   }
   async init() {
     await privateDir(path4.join(this.config.home, "tasks"));
-    await privateDir(path4.join(this.config.home, "waits"));
     await this.tick();
     this.timer = setInterval(() => {
       this.tick().catch((e) => console.error(e.message));
@@ -578,44 +614,10 @@ var Supervisor = class {
       this.tickBusy = false;
     }
   }
-  async wait(input2, sliceMs = 2e4) {
-    let wait;
-    let id2 = input2.wait_id;
-    if (id2) {
-      wait = await readJson(path4.join(this.config.home, "waits", validWaitId(id2) + ".json"));
-      if (!wait) throw new Error("Wait not found.");
-    } else {
-      if (!input2.task_ids?.length) throw new Error("task_ids is required for a new wait.");
-      const timeout = input2.timeout_ms ?? WAIT_DEFAULT;
-      if (timeout < WAIT_MIN || timeout > WAIT_MAX) throw new Error("Wait timeout must be 10\u201330 minutes.");
-      for (const taskId of input2.task_ids) await this.task(taskId);
-      id2 = newId();
-      wait = { ids: input2.task_ids, mode: input2.mode || "all", deadline: Date.now() + timeout };
-      await atomicJson(path4.join(this.config.home, "waits", id2 + ".json"), wait);
-    }
-    const sliceEnd = Math.min(Date.now() + Math.min(sliceMs, 5e4), wait.deadline);
-    let tasks;
-    let ready;
-    do {
-      tasks = await Promise.all(wait.ids.map((taskId) => this.status(taskId)));
-      ready = wait.mode === "any" ? tasks.some((t) => TERMINAL.has(t.status)) : tasks.every((t) => TERMINAL.has(t.status));
-      if (ready || Date.now() >= sliceEnd) break;
-      await delay(Math.min(200, sliceEnd - Date.now()));
-    } while (true);
-    return {
-      wait_id: id2,
-      deadline: new Date(wait.deadline).toISOString(),
-      ready,
-      timed_out: !ready && Date.now() >= wait.deadline,
-      tasks,
-      instruction: ready ? "Inspect task results." : "Tasks continue running. Call zcode_wait with the same wait_id to preserve the deadline."
-    };
+  wait(input2, options) {
+    return waitForTasks((id2) => this.status(id2), input2.task_ids, options);
   }
 };
-function validWaitId(id2) {
-  if (!/^[a-f0-9-]{36}$/.test(id2)) throw new Error("Invalid wait ID.");
-  return id2;
-}
 
 // node_modules/zod/v4/classic/external.js
 var external_exports = {};
@@ -20317,10 +20319,7 @@ var schemas = {
     limit: external_exports.number().int().min(1).max(100).default(25)
   }).strict(),
   zcode_wait: external_exports.object({
-    task_ids: external_exports.array(id).min(1).max(100).optional(),
-    wait_id: id.optional(),
-    mode: external_exports.enum(["any", "all"]).default("all"),
-    timeout_ms: external_exports.number().int().min(6e5).max(18e5).default(9e5)
+    task_ids: external_exports.array(id).min(1).max(100).describe("Required task IDs to watch. Wait up to 10 minutes in this call; return when any listed task reaches a terminal state. Only these tasks can wake this wait.")
   }).strict(),
   zcode_doctor: external_exports.object({}).strict(),
   zcode_models: external_exports.object({}).strict()
@@ -20330,7 +20329,6 @@ function validate2(method, params) {
   if (!schema) throw new Error("Unknown tool: " + method);
   const input2 = schema.parse(params || {});
   if (method === "zcode_spawn" && !input2.cwd.startsWith("/")) throw new Error("cwd must be an absolute path.");
-  if (method === "zcode_wait" && !input2.wait_id && !input2.task_ids) throw new Error("Supply task_ids or a wait_id.");
   return input2;
 }
 
@@ -20367,6 +20365,8 @@ async function startDaemon(config2 = settings()) {
   const supervisor = new Supervisor(config2);
   await supervisor.init();
   const server = http2.createServer(async (req, res) => {
+    const waiting = new AbortController();
+    res.once("close", () => waiting.abort());
     res.setHeader("Content-Type", "application/json");
     try {
       if (req.method === "GET" && req.url === "/health") {
@@ -20401,7 +20401,7 @@ async function startDaemon(config2 = settings()) {
           result = await supervisor.cancel(input2.task_id);
           break;
         case "zcode_wait":
-          result = await supervisor.wait(input2);
+          result = await supervisor.wait(input2, { signal: waiting.signal });
           break;
         case "zcode_list": {
           const all = await supervisor.list(input2.workflow_id);
@@ -20433,7 +20433,7 @@ async function startDaemon(config2 = settings()) {
             appServer,
             data_directory: config2.home,
             resource_cleanup: { policy: "release-idle-workspaces", adapter_update: supervisor.resources.upgrade },
-            wait: { default_ms: 9e5, min_ms: 6e5, max_ms: 18e5, slice_ms: 2e4 }
+            wait: { timeout_ms: WAIT_TIMEOUT, mode: "any", task_ids_required: true, blocking: true }
           };
           break;
         }

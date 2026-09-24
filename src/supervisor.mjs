@@ -3,11 +3,12 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { atomicJson, readJson, privateDir, newId, taskDir, now, digest, sameProcess,
-  TERMINAL, WAIT_DEFAULT, WAIT_MIN, WAIT_MAX, delay, processIdentity } from './common.mjs';
+  TERMINAL, delay, processIdentity } from './common.mjs';
 import { inspectWorkspace } from './workspace.mjs';
 import { hostCall } from './host-client.mjs';
 import { runningConversation } from './conversation.mjs';
 import { ResourceReaper, activeTask, workspaceFor } from './resources.mjs';
+import { waitForTasks } from './wait.mjs';
 
 const workerPath = fileURLToPath(new URL('./worker.mjs', import.meta.url));
 const active = activeTask;
@@ -21,7 +22,6 @@ export class Supervisor {
   }
   async init() {
     await privateDir(path.join(this.config.home, 'tasks'));
-    await privateDir(path.join(this.config.home, 'waits'));
     await this.tick();
     this.timer = setInterval(() => { this.tick().catch((e) => console.error(e.message)); }, 300);
   }
@@ -229,37 +229,7 @@ export class Supervisor {
       }
     } finally { this.tickBusy = false; }
   }
-  async wait(input, sliceMs = 20000) {
-    let wait;
-    let id = input.wait_id;
-    if (id) {
-      wait = await readJson(path.join(this.config.home, 'waits', validWaitId(id) + '.json'));
-      if (!wait) throw new Error('Wait not found.');
-    } else {
-      if (!input.task_ids?.length) throw new Error('task_ids is required for a new wait.');
-      const timeout = input.timeout_ms ?? WAIT_DEFAULT;
-      if (timeout < WAIT_MIN || timeout > WAIT_MAX) throw new Error('Wait timeout must be 10–30 minutes.');
-      for (const taskId of input.task_ids) await this.task(taskId);
-      id = newId();
-      wait = { ids: input.task_ids, mode: input.mode || 'all', deadline: Date.now() + timeout };
-      await atomicJson(path.join(this.config.home, 'waits', id + '.json'), wait);
-    }
-    const sliceEnd = Math.min(Date.now() + Math.min(sliceMs, 50000), wait.deadline);
-    let tasks;
-    let ready;
-    do {
-      tasks = await Promise.all(wait.ids.map((taskId) => this.status(taskId)));
-      ready = wait.mode === 'any' ? tasks.some((t) => TERMINAL.has(t.status)) : tasks.every((t) => TERMINAL.has(t.status));
-      if (ready || Date.now() >= sliceEnd) break;
-      await delay(Math.min(200, sliceEnd - Date.now()));
-    } while (true);
-    return { wait_id: id, deadline: new Date(wait.deadline).toISOString(),
-      ready, timed_out: !ready && Date.now() >= wait.deadline, tasks,
-      instruction: ready ? 'Inspect task results.' : 'Tasks continue running. Call zcode_wait with the same wait_id to preserve the deadline.' };
+  wait(input, options) {
+    return waitForTasks((id) => this.status(id), input.task_ids, options);
   }
-}
-
-function validWaitId(id) {
-  if (!/^[a-f0-9-]{36}$/.test(id)) throw new Error('Invalid wait ID.');
-  return id;
 }

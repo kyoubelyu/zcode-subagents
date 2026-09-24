@@ -2,7 +2,10 @@
   "mcpServers": {
     "zcode-subagents": {
       "command": "node",
-      "args": ["${PLUGIN_ROOT}/dist/server.mjs"]
+      "args": ["dist/server.mjs"],
+      "cwd": ".",
+      "env_vars": ["ZCODE_SUBAGENTS_HOME", "ZCODE_SUBAGENTS_RUNTIME_ROOT", "ZCODE_SUBAGENTS_CONCURRENCY"],
+      "tool_timeout_sec": 660
     }
   }
 }

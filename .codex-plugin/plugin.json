@@ -1,6 +1,6 @@
 {
   "name": "zcode-subagents",
-  "version": "0.2.0+codex.20260923101127",
+  "version": "0.2.0+codex.20260924064342",
   "description": "Call ZCode subagent tools directly in Codex, with desktop app-server model routing and a shared 12-task limit.",
   "author": {
     "name": "kyoubelyu"
