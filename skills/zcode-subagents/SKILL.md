@@ -15,6 +15,16 @@ to the shared desktop app-server task pool. Do not substitute shell commands for
 available plugin tools. These are external ZCode sessions, not native spawn_agent
 or wait_agent sessions.
 
+When zcode_wait is exposed as a direct tool, call it directly. If it is only
+available through functions.exec, a `Script running with cell ID ...` response
+means the wrapper yielded while the tool call is still pending. Resume the same
+cell until it returns the actual result; do not submit a duplicate wait, claim
+completion/timeout, or start work that depends on the result merely because the
+wrapper yielded. For a user requesting direct blocking waits, the
+[README setup](../../README.md#keep-long-waits-in-a-direct-tool-call) explains
+Codex's direct_only_tool_namespaces setting and the required new thread.
+Installing the plugin does not change that user configuration.
+
 The MCP connection owns no task lifecycle. Disconnecting it does not cancel or
 replay tasks. After reconnecting, query existing task IDs; retry a lost spawn reply
 only with the identical workflow_id/request_key and payload. Backend/validation

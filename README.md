@@ -70,6 +70,34 @@ Try:
 
 > Give ZCode a focused implementation task in a worktree. Choose GLM-5.3 explicitly, inspect its diff, and run its tests.
 
+### Keep long waits in a direct tool call
+
+To have Codex wait for the tool result before continuing, add this to your user
+configuration (`~/.codex/config.toml`, or `$CODEX_HOME/config.toml`):
+
+```toml
+[features.code_mode]
+direct_only_tool_namespaces = ["mcp__zcode_subagents"]
+```
+
+If that table or list already exists, add the namespace to it and preserve the
+other settings and entries. This is a Codex client setting; installing or
+updating the plugin does not apply it automatically. Start a **new Codex thread**
+after changing it.
+
+Codex's [direct-only tool namespace setting](https://learn.chatgpt.com/docs/config-file/config-reference)
+exposes the ZCode tools as direct calls and removes them from the code-mode
+executor. It was verified with Codex CLI **0.156.1**. A direct `zcode_wait` call
+returns when any selected task ends or its ten-minute deadline expires.
+
+Without this setting, Codex may wrap the call in `functions.exec`. That outer
+executor can yield a `Script running with cell ID ...` response while the same
+`zcode_wait` call continues in the background, allowing Codex to speak or work in
+the meantime. This is separate from the plugin's wait deadline. Resume that
+same execution cell until it returns the actual tool result; a yielded cell is
+not a completed or timed-out wait. Changing `wait_agent` defaults does not
+control this wrapper or the plugin's wait.
+
 ### Upgrading from 0.1
 
 Finish or cancel old 0.1 tasks, then run `node scripts/control.mjs stop` from the old source checkout if its supervisor is still running. Update/reinstall the plugin and open a new Codex thread. All seven original tools are available, plus `zcode_models`. Existing 0.2 app-server tasks share the same supervisor and Host with the restored MCP adapter.
@@ -157,6 +185,10 @@ For a followup, pass `task_id`, a new `request_key`, and `prompt`; optionally pa
 ## Waiting, failures and review
 
 `zcode_wait` blocks in **one call for up to 10 minutes**, returning as soon as **any** listed task ends. A non-empty `task_ids` array is required (1–100 UUIDs). IDs can belong to different sessions and workflows in the shared pool. Unlisted tasks cannot wake the wait, and simultaneous callers do not consume each other's completion events.
+
+For Codex to stay in that direct tool call, use the
+[client configuration above](#keep-long-waits-in-a-direct-tool-call). The plugin
+deadline does not control when an outer code-mode executor yields.
 
 ```json
 {"task_ids":["<task-a-uuid>","<task-b-uuid>"]}
